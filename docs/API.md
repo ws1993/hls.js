@@ -1,4 +1,4 @@
-# API
+# HLS.js v1 API
 
 <!-- START doctoc generated TOC please keep comment here to allow auto update -->
 <!-- DON'T EDIT THIS SECTION, INSTEAD RE-RUN doctoc TO UPDATE -->
@@ -1151,6 +1151,20 @@ The Widevine license server URL.
 
 A pre-processor function for modifying the `XMLHttpRequest` and request url (using `xhr.open`) prior to sending the license request.
 
+```js
+var config = {
+  licenseXhrSetup: function (xhr, url) {
+    xhr.withCredentials = true; // do send cookies
+    if (!xhr.readyState) {
+      // Call open to change the method (default is POST) or modify the url
+      xhr.open('GET', url, true);
+      // Append headers after opening
+      xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+    }
+  },
+};
+```
+
 ### `licenseResponseCallback`
 
 (default: `undefined`, type `(xhr: XMLHttpRequest, url: string) => data: ArrayBuffer`)
@@ -1330,7 +1344,9 @@ get/set : if set to true the active subtitle track mode will be set to `showing`
 
 ### `hls.liveSyncPosition`
 
-get : position of live sync point (ie edge of live position minus safety delay defined by `hls.config.liveSyncDuration`)
+get : position of live sync point (ie edge of live position minus safety delay defined by `hls.config.liveSyncDuration`).
+If playback stalls outside the sliding window, or latency exceeds `liveMaxLatencyDuration` hls.js will seek ahead to
+`liveSyncPosition` to get back in sync with the stream stream.
 
 ### `hls.latency`
 
@@ -1346,6 +1362,10 @@ returns 0 before first playlist is loaded
 ### `hls.targetLatency`
 
 get : target distance from the edge as calculated by the latency controller
+
+### `hls.drift`
+
+get : the rate at which the edge of the current live playlist is advancing or 1 if there is none
 
 ## Runtime Events
 

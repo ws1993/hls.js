@@ -52,7 +52,7 @@ function setupConsoleLogRedirection() {
 }
 
 // Object.assign polyfill
-function objectAssign(target, firstSource) {
+function objectAssign(target) {
   if (target === undefined || target === null) {
     throw new TypeError('Cannot convert first argument to object');
   }
@@ -143,7 +143,7 @@ function startStream(streamUrl, config, callback, autoplay) {
         callback({ code: data.details, logs: logString });
       }
     });
-    video.onerror = function (event) {
+    video.onerror = function () {
       console.log('[test] > video error, code :' + video.error.code);
       callback({ code: 'video_error_' + video.error.code, logs: logString });
     };

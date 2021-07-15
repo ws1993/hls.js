@@ -82,7 +82,11 @@ export interface AudioTrackSwitchedData {
 // @public (undocumented)
 export interface AudioTrackSwitchingData {
     // (undocumented)
+    groupId: string;
+    // (undocumented)
     id: number;
+    // (undocumented)
+    name: string;
     // (undocumented)
     type: MediaPlaylistType | 'main';
     // (undocumented)
@@ -207,6 +211,8 @@ export interface BufferFlushedData {
 export interface BufferFlushingData {
     // (undocumented)
     endOffset: number;
+    // (undocumented)
+    endOffsetSubtitles?: number;
     // (undocumented)
     startOffset: number;
     // (undocumented)
@@ -711,6 +717,8 @@ export class Fragment extends BaseSegment {
     // (undocumented)
     endPTS?: number;
     // (undocumented)
+    initSegment: Fragment | null;
+    // (undocumented)
     level: number;
     // (undocumented)
     levelkey?: LevelKey;
@@ -841,6 +849,7 @@ class Hls implements HlsEventEmitter {
     static set DefaultConfig(defaultConfig: HlsConfig);
     destroy(): void;
     detachMedia(): void;
+    get drift(): number | null;
     // (undocumented)
     emit<E extends keyof HlsListeners>(event: E, name: E, eventObject: Parameters<HlsListeners[E]>[1]): boolean;
     // (undocumented)
@@ -1123,11 +1132,11 @@ export enum HlsSkip {
 //
 // @public (undocumented)
 export class HlsUrlParameters {
-    constructor(msn: number, part?: number, skip?: HlsSkip);
+    constructor(msn?: number, part?: number, skip?: HlsSkip);
     // (undocumented)
     addDirectives(uri: string): string | never;
     // (undocumented)
-    msn: number;
+    msn?: number;
     // (undocumented)
     part?: number;
     // (undocumented)
@@ -1313,6 +1322,16 @@ export class LevelDetails {
     // (undocumented)
     deltaUpdateFailed?: boolean;
     // (undocumented)
+    get drift(): number;
+    // (undocumented)
+    driftEnd: number;
+    // (undocumented)
+    driftEndTime: number;
+    // (undocumented)
+    driftStart: number;
+    // (undocumented)
+    driftStartTime: number;
+    // (undocumented)
     get edge(): number;
     // (undocumented)
     endCC: number;
@@ -1328,8 +1347,6 @@ export class LevelDetails {
     get hasProgramDateTime(): boolean;
     // (undocumented)
     holdBack: number;
-    // (undocumented)
-    initSegment: Fragment | null;
     // (undocumented)
     get lastPartIndex(): number;
     // (undocumented)
@@ -1544,12 +1561,9 @@ export interface Loader<T extends LoaderContext> {
     context: T;
     // (undocumented)
     destroy(): void;
-    // (undocumented)
-    getResponseHeader(name: string): string | null;
+    getCacheAge?: () => number | null;
     // (undocumented)
     load(context: LoaderContext, config: LoaderConfiguration, callbacks: LoaderCallbacks<T>): void;
-    // (undocumented)
-    loader: any;
     // (undocumented)
     stats: LoaderStats;
 }
@@ -1998,7 +2012,11 @@ export interface SubtitleTracksUpdatedData {
 // @public (undocumented)
 export interface SubtitleTrackSwitchData {
     // (undocumented)
+    groupId?: string;
+    // (undocumented)
     id: number;
+    // (undocumented)
+    name?: string;
     // (undocumented)
     type?: MediaPlaylistType | 'main';
     // (undocumented)
