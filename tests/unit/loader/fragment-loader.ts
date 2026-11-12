@@ -1,61 +1,34 @@
-import FragmentLoader, { LoadError } from '../../../src/loader/fragment-loader';
-import { Fragment } from '../../../src/loader/fragment';
-import { ErrorDetails, ErrorTypes } from '../../../src/errors';
-import { LoadStats } from '../../../src/loader/load-stats';
-import {
-  FragmentLoaderContext,
-  Loader,
-  LoaderCallbacks,
-  LoaderContext,
-  PlaylistLevelType,
-} from '../../../src/types/loader';
+import { expect, use } from 'chai';
+import sinon from 'sinon';
+import sinonChai from 'sinon-chai';
 import { hlsDefaultConfig, mergeConfig } from '../../../src/config';
-import type { HlsConfig } from '../../../src/config';
-
-import * as sinon from 'sinon';
-import * as chai from 'chai';
-import * as sinonChai from 'sinon-chai';
+import { ErrorDetails, ErrorTypes } from '../../../src/errors';
+import { Fragment } from '../../../src/loader/fragment';
+import FragmentLoader, { LoadError } from '../../../src/loader/fragment-loader';
 import { LevelDetails } from '../../../src/loader/level-details';
+import { LoadStats } from '../../../src/loader/load-stats';
+import { PlaylistLevelType } from '../../../src/types/loader';
+import { logger } from '../../../src/utils/logger';
+import { MockXhr } from '../../mocks/loader.mock';
+import type { MediaFragment } from '../../../src/loader/fragment';
 
-chai.use(sinonChai);
-const expect = chai.expect;
-
-class MockXhr implements Loader<LoaderContext> {
-  context!: LoaderContext;
-  loader: any;
-  stats: LoadStats;
-  callbacks?: LoaderCallbacks<FragmentLoaderContext>;
-
-  constructor(confg: HlsConfig) {
-    this.stats = new LoadStats();
-  }
-
-  load(context, config, callbacks) {
-    this.callbacks = callbacks;
-  }
-
-  abort() {}
-  destroy(): void {}
-  getResponseHeader(name: string): string | null {
-    return null;
-  }
-}
+use(sinonChai);
 
 describe('FragmentLoader tests', function () {
-  const sandbox = sinon.createSandbox();
   let fragmentLoader: FragmentLoader;
-  let frag;
-  let levelDetails;
+  let frag: MediaFragment;
+  let levelDetails: LevelDetails;
   let response;
   let context;
-  let stats;
+  let stats: LoadStats;
   let networkDetails;
+
   beforeEach(function () {
     fragmentLoader = new FragmentLoader(
-      mergeConfig(hlsDefaultConfig, { loader: MockXhr })
+      mergeConfig(hlsDefaultConfig, { loader: MockXhr }, logger),
     );
-    frag = new Fragment(PlaylistLevelType.MAIN, '');
-    frag.url = 'foo';
+    frag = new Fragment(PlaylistLevelType.MAIN, '') as MediaFragment;
+    frag.relurl = 'foo';
     levelDetails = new LevelDetails('');
     levelDetails.fragments.push(frag);
     response = {};
@@ -65,7 +38,7 @@ describe('FragmentLoader tests', function () {
   });
 
   afterEach(function () {
-    sandbox.restore();
+    fragmentLoader.destroy();
   });
 
   it('handles successful fragment loading', function () {
@@ -74,7 +47,7 @@ describe('FragmentLoader tests', function () {
       const onProgress = sinon.spy();
       const fragmentLoaderPrivates = fragmentLoader as any;
       fragmentLoader
-        .load(frag, onProgress)
+        .load(frag, false, onProgress)
         .then((data) => {
           expect(data).to.deep.equal({
             frag,
@@ -103,22 +76,22 @@ describe('FragmentLoader tests', function () {
         stats,
         context,
         response.data,
-        networkDetails
+        networkDetails,
       );
       fragmentLoaderPrivates.loader.callbacks.onSuccess(
         response,
         stats,
         context,
-        networkDetails
+        networkDetails,
       );
     });
   });
 
   it('should reject with a LoadError if the fragment does not have a url', function () {
     return new Promise<void>((resolve, reject) => {
-      frag.url = null;
+      frag.relurl = undefined;
       fragmentLoader
-        .load(frag, levelDetails)
+        .load(frag)
         .then(() => {
           reject(new Error('Fragment loader should not have resolved'));
         })
@@ -129,63 +102,172 @@ describe('FragmentLoader tests', function () {
   });
 
   it('handles fragment load errors', function () {
-    return new Promise<void>((resolve, reject) => {
-      const fragmentLoaderPrivates = fragmentLoader as any;
+    const fragmentLoaderPrivates = fragmentLoader as any;
+    return new Promise<LoadError>((resolve, reject) => {
       fragmentLoader
-        .load(frag, levelDetails)
+        .load(frag)
         .then(() => {
           reject(new Error('Fragment loader should not have resolved'));
         })
         .catch((error) => {
-          expect(error).to.be.instanceOf(LoadError);
-          expect(error.data).to.deep.equal({
-            type: ErrorTypes.NETWORK_ERROR,
-            details: ErrorDetails.FRAG_LOAD_ERROR,
-            fatal: false,
-            frag,
-            response,
-            networkDetails,
-          });
-          expect(fragmentLoaderPrivates.loader).to.not.exist;
-          expect(frag.loader).to.not.exist;
-          resolve();
+          resolve(error);
         });
       expect(fragmentLoaderPrivates.loader).to.be.instanceOf(MockXhr);
+      const stats = new LoadStats();
       fragmentLoaderPrivates.loader.callbacks.onError(
         response,
         context,
-        networkDetails
+        networkDetails,
+        stats,
       );
+    }).then((error: LoadError) => {
+      expect(error).to.be.instanceOf(LoadError);
+      expect(error.data).to.deep.equal(
+        {
+          type: ErrorTypes.NETWORK_ERROR,
+          details: ErrorDetails.FRAG_LOAD_ERROR,
+          fatal: false,
+          frag,
+          response: { url: frag.url, data: undefined, ...response },
+          error: error.data.error,
+          networkDetails,
+          stats,
+        },
+        JSON.stringify(error.data, null, 2),
+      );
+      expect(fragmentLoaderPrivates.loader).to.not.exist;
+      expect(frag.loader).to.not.exist;
     });
   });
 
+  it('buffers progress callbacks until progressGate resolves', function () {
+    response = { data: new Uint8Array(4) };
+    const onProgress = sinon.spy();
+    let resolveGate: () => void;
+    const progressGate = new Promise<void>((res) => {
+      resolveGate = res;
+    });
+    const fragmentLoaderPrivates = fragmentLoader as any;
+    const chunk1 = new ArrayBuffer(4);
+    const chunk2 = new ArrayBuffer(8);
+
+    const loadPromise = fragmentLoader.load(
+      frag,
+      false,
+      onProgress,
+      progressGate,
+    );
+
+    fragmentLoaderPrivates.loader.callbacks.onProgress(
+      stats,
+      context,
+      chunk1,
+      networkDetails,
+    );
+    fragmentLoaderPrivates.loader.callbacks.onProgress(
+      stats,
+      context,
+      chunk2,
+      networkDetails,
+    );
+    expect(onProgress).to.not.have.been.called;
+
+    resolveGate!();
+
+    return Promise.resolve()
+      .then(() => {
+        expect(onProgress).to.have.been.calledTwice;
+        expect(onProgress.firstCall).to.have.been.calledWith({
+          frag,
+          part: null,
+          payload: chunk1,
+          networkDetails,
+        });
+        expect(onProgress.secondCall).to.have.been.calledWith({
+          frag,
+          part: null,
+          payload: chunk2,
+          networkDetails,
+        });
+        fragmentLoaderPrivates.loader.callbacks.onSuccess(
+          response,
+          stats,
+          context,
+          networkDetails,
+        );
+      })
+      .then(() => loadPromise)
+      .then((data) => {
+        expect(data.payload).to.equal(response.data);
+      });
+  });
+
+  it('forwards progress callbacks immediately after progressGate resolves', function () {
+    response = { data: new Uint8Array(4) };
+    const onProgress = sinon.spy();
+    const progressGate = Promise.resolve();
+    const fragmentLoaderPrivates = fragmentLoader as any;
+    const chunk = new ArrayBuffer(4);
+
+    const loadPromise = fragmentLoader.load(
+      frag,
+      false,
+      onProgress,
+      progressGate,
+    );
+
+    return progressGate
+      .then(() => {
+        fragmentLoaderPrivates.loader.callbacks.onProgress(
+          stats,
+          context,
+          chunk,
+          networkDetails,
+        );
+        expect(onProgress).to.have.been.calledOnceWith({
+          frag,
+          part: null,
+          payload: chunk,
+          networkDetails,
+        });
+        fragmentLoaderPrivates.loader.callbacks.onSuccess(
+          response,
+          stats,
+          context,
+          networkDetails,
+        );
+      })
+      .then(() => loadPromise);
+  });
+
   it('handles fragment load timeouts', function () {
-    // let abortSpy;
-    return new Promise<void>((resolve, reject) => {
-      const fragmentLoaderPrivates = fragmentLoader as any;
+    const fragmentLoaderPrivates = fragmentLoader as any;
+    return new Promise<LoadError>((resolve, reject) => {
       fragmentLoader
-        .load(frag, levelDetails)
+        .load(frag)
         .then(() => {
           reject(new Error('Fragment loader should not have resolved'));
         })
         .catch((error) => {
-          expect(error).to.be.instanceOf(LoadError);
-          expect(error.data).to.deep.equal({
-            type: ErrorTypes.NETWORK_ERROR,
-            details: ErrorDetails.FRAG_LOAD_TIMEOUT,
-            fatal: false,
-            frag,
-            networkDetails,
-          });
-          expect(fragmentLoaderPrivates.loader).to.not.exist;
-          expect(frag.loader).to.not.exist;
-          // expect(abortSpy).to.have.been.calledOnce();
-          resolve();
+          resolve(error);
         });
       const loaderInstance: MockXhr = fragmentLoaderPrivates.loader;
       expect(loaderInstance).to.be.instanceOf(MockXhr);
-      // abortSpy = sinon.spy(loaderInstance.abort);
-      loaderInstance.callbacks!.onTimeout(response, context, networkDetails);
+      const stats = new LoadStats();
+      loaderInstance.callbacks!.onTimeout(stats, context, networkDetails);
+    }).then((error: LoadError) => {
+      expect(error).to.be.instanceOf(LoadError);
+      expect(error.data).to.deep.equal({
+        type: ErrorTypes.NETWORK_ERROR,
+        details: ErrorDetails.FRAG_LOAD_TIMEOUT,
+        fatal: false,
+        frag,
+        error: error.data.error,
+        networkDetails,
+        stats,
+      });
+      expect(fragmentLoaderPrivates.loader).to.not.exist;
+      expect(frag.loader).to.not.exist;
     });
   });
 });

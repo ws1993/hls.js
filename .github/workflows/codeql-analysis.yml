@@ -8,11 +8,17 @@ on:
   schedule:
     - cron: '0 3 * * 1'
 
+permissions:
+  actions: read
+  security-events: write
+
 jobs:
   analyze:
     name: Analyze
     runs-on: ubuntu-latest
-
+    concurrency:
+      group: 'codeql-analysis:analyze:${{ github.ref }}'
+      cancel-in-progress: true
     strategy:
       fail-fast: false
       matrix:
@@ -20,12 +26,12 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v2
+        uses: actions/checkout@v7
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@v1
+        uses: github/codeql-action/init@v3
         with:
           languages: ${{ matrix.language }}
 
       - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v1
+        uses: github/codeql-action/analyze@v3

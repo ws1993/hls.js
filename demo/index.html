@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+<!doctype html>
 <html>
   <head>
     <meta charset="utf-8" />
@@ -15,7 +15,7 @@
     <script src="https://ajax.googleapis.com/ajax/libs/jquery/2.1.3/jquery.min.js"></script>
     <script src="https://maxcdn.bootstrapcdn.com/bootstrap/3.3.4/js/bootstrap.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/FileSaver.js/1.3.8/FileSaver.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/ace/1.4.12/ace.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/ace/1.37.5/ace.js"></script>
   </head>
   <body>
     <div class="header-container">
@@ -31,7 +31,7 @@
         <h2 class="title">demo</h2>
 
         <h3>
-          <a href="../api-docs">API docs | usage guide</a>
+          <a href="../api-docs/">API docs | usage guide</a>
         </h3>
       </header>
     </div>
@@ -148,6 +148,7 @@
         id="video"
         controls
         autoplay
+        playsinline
         class="videoCentered"
         style="width: 80%"
       ></video>
@@ -396,7 +397,7 @@
         id="timelineTab"
         style="display: none"
       >
-        <canvas id="timeline-chart"></canvas>
+        <canvas id="timeline-chart" style="touch-action: manipulation"></canvas>
       </div>
 
       <div
@@ -451,6 +452,12 @@
           <tr>
             <td>Current audio-track:</td>
             <td><div id="audioTrackControl" style="display: inline"></div></td>
+          </tr>
+          <tr>
+            <td>Next audio-track:</td>
+            <td>
+              <div id="nextAudioTrackControl" style="display: inline"></div>
+            </td>
           </tr>
           <tr>
             <td>Language / Name:</td>
@@ -626,7 +633,7 @@
           <canvas
             id="bitrateTimerange_c"
             width="640"
-            height="100"
+            height="115"
             style="border: 1px solid #000000"
           ></canvas>
           <canvas
@@ -666,7 +673,6 @@
     <!-- Demo page required libs -->
     <script src="canvas.js"></script>
     <script src="metrics.js"></script>
-    <script src="libs/jsonpack.js"></script>
 
     <!-- demo build -->
     <script src="../dist/hls.js"></script>

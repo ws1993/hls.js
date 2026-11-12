@@ -1,3 +1,6 @@
+import { expect } from 'chai';
+import sinon from 'sinon';
+import EventEmitter from 'eventemitter3';
 import {
   getAudioConfig,
   isHeaderPattern,
@@ -9,186 +12,134 @@ import {
   getFrameDuration,
   parseFrameHeader,
   appendFrame,
-} from '../../../src/demux/adts';
+} from '../../../src/demux/audio/adts';
 import { ErrorTypes } from '../../../src/errors';
 
-const sinon = require('sinon');
-
 describe('getAudioConfig', function () {
-  it('should trigger a MEDIA_ERROR event if sample index is invalid', function () {
-    const observer = {
-      trigger: sinon.spy(),
-    };
+  it('should emit a MEDIA_ERROR event if sample index is invalid', function () {
+    const observer = new EventEmitter();
+    sinon.spy(observer, 'emit');
     const data = new Uint8Array(new ArrayBuffer(4));
     data[0] = 0xff;
     data[1] = 0xf0; // ID = 0 (MPEG-4), layer = 00, protection_absent = 0
     data[2] = 0x34; // sampling_frequency_index = 14, which is a reserved value
 
     expect(getAudioConfig(observer, data, 0, 'mp4a.40.29')).to.not.exist;
-    expect(observer.trigger).to.have.been.calledOnce;
-    expect(observer.trigger.args[0][1].type).to.equal(ErrorTypes.MEDIA_ERROR);
+    expect(observer.emit).to.have.been.calledOnce;
+    expect(observer.emit.args[0][2].type).to.equal(
+      ErrorTypes.MEDIA_ERROR,
+      JSON.stringify(observer.emit.args, null, 2),
+    );
   });
 
-  it('should return audio config for firefox if the specified sampling frequency > 24kHz', function () {
-    const observer = {
-      trigger: sinon.stub(navigator, 'userAgent').get(() => 'firefox'),
-    };
+  it('should return audio config for 48kHz', function () {
+    const observer = new EventEmitter();
     const data = new Uint8Array(new ArrayBuffer(4));
     data[0] = 0xff;
     data[1] = 0xf0; // ID = 0 (MPEG-4), layer = 00, protection_absent = 0
-    data[2] = 0x00; // sampling_frequency_index = 0
+    data[2] = 0x4c; // sampling_frequency_index = 3
 
-    expect(getAudioConfig(observer, data, 0, 'mp4a.40.29')).to.deep.equal({
-      config: [16, 0],
-      samplerate: 96000,
+    const result = getAudioConfig(observer, data, 0, 'mp4a.40.29');
+    expect(result, JSON.stringify(result)).to.deep.equal({
+      config: [17, 128],
+      samplerate: 48000,
       channelCount: 0,
       codec: 'mp4a.40.2',
+      parsedCodec: 'mp4a.40.2',
       manifestCodec: 'mp4a.40.29',
     });
   });
 
-  it('should return audio config with a different extension sampling index for Firefox if sampling freq is low', function () {
-    const observer = {
-      trigger: sinon.stub(navigator, 'userAgent').get(() => 'Firefox'),
-    };
+  it('should treat AAC Main (object type 1) with low sample rate as implicit HE-AAC (SBR)', function () {
+    const observer = new EventEmitter();
     const data = new Uint8Array(new ArrayBuffer(4));
     data[0] = 0xff;
     data[1] = 0xf0; // ID = 0 (MPEG-4), layer = 00, protection_absent = 0
-    data[2] = 0x28; // sampling_frequency_index = 10
+    data[2] = 0x28; // profile = 0 (AAC Main), sampling_frequency_index = 10 (11025Hz)
 
-    expect(getAudioConfig(observer, data, 0, 'mp4a.40.29')).to.deep.equal({
+    const result = getAudioConfig(observer, data, 0, 'mp4a.40.29');
+    expect(result, JSON.stringify(result)).to.deep.equal({
       config: [45, 3, 136, 0],
       samplerate: 11025,
       channelCount: 0,
       codec: 'mp4a.40.5',
+      parsedCodec: 'mp4a.40.5',
       manifestCodec: 'mp4a.40.29',
     });
   });
 
-  it('should return audio config for Android', function () {
-    const observer = {
-      trigger: sinon.stub(navigator, 'userAgent').get(() => 'Android'),
-    };
+  it('should treat AAC Main at sampling index 6 (24kHz) as implicit HE-AAC', function () {
+    const observer = new EventEmitter();
     const data = new Uint8Array(new ArrayBuffer(4));
     data[0] = 0xff;
     data[1] = 0xf0; // ID = 0 (MPEG-4), layer = 00, protection_absent = 0
-    data[2] = 0x28; // sampling_frequency_index = 10
+    data[2] = 0x18; // profile = 0 (AAC Main), sampling_frequency_index = 6 (24000Hz)
+    data[3] = 0x80; // channel_configuration = 2 (stereo)
 
-    expect(getAudioConfig(observer, data, 0, 'mp4a.40.29')).to.deep.equal({
-      config: [21, 0],
-      samplerate: 11025,
-      channelCount: 0,
-      codec: 'mp4a.40.2',
-      manifestCodec: 'mp4a.40.29',
-    });
-  });
-
-  it('should return audio config for Chrome', function () {
-    const observer = {
-      trigger: sinon.stub(navigator, 'userAgent').get(() => 'Chrome'),
-    };
-    const data = new Uint8Array(new ArrayBuffer(4));
-    data[0] = 0xff;
-    data[1] = 0xf0; // ID = 0 (MPEG-4), layer = 00, protection_absent = 0
-    data[2] = 0x28; // sampling_frequency_index = 10
-
-    expect(getAudioConfig(observer, data, 0, 'mp4a.40.29')).to.deep.equal({
-      config: [45, 3, 136, 0],
-      samplerate: 11025,
-      channelCount: 0,
+    const result = getAudioConfig(observer, data, 0, undefined);
+    expect(result, JSON.stringify(result)).to.deep.equal({
+      config: [43, 17, 136, 0],
+      samplerate: 24000,
+      channelCount: 2,
       codec: 'mp4a.40.5',
-      manifestCodec: 'mp4a.40.29',
-    });
-  });
-
-  it('should return audio config for Chrome if there is no audio codec', function () {
-    const observer = {
-      trigger: sinon.stub(navigator, 'userAgent').get(() => 'Chrome'),
-    };
-    const data = new Uint8Array(new ArrayBuffer(4));
-    data[0] = 0xff;
-    data[1] = 0xf0; // ID = 0 (MPEG-4), layer = 00, protection_absent = 0
-    data[2] = 0x28; // sampling_frequency_index = 10
-
-    expect(getAudioConfig(observer, data, 0)).to.deep.equal({
-      config: [45, 3, 136, 0],
-      samplerate: 11025,
-      channelCount: 0,
-      codec: 'mp4a.40.5',
+      parsedCodec: 'mp4a.40.5',
       manifestCodec: undefined,
     });
   });
 
-  it('should return audio config for Chrome if there is no audio codec and freq is high enough', function () {
-    const observer = {
-      trigger: sinon.stub(navigator, 'userAgent').get(() => 'Chrome'),
-    };
+  it('should return audio config if there is no audio codec', function () {
+    const observer = new EventEmitter();
     const data = new Uint8Array(new ArrayBuffer(4));
     data[0] = 0xff;
-    data[1] = 0xf0; // ID = 0 (MPEG-4), layer = 00, protection_absent = 0
-    data[2] = 0x08; // sampling_frequency_index = 2
+    data[1] = 0xf1; // ID = 0 (MPEG-4), layer = 00
+    data[2] = 0x5c; // sampling_frequency_index = 7
+    data[3] = 0x80; // stereo channels
 
-    expect(getAudioConfig(observer, data, 0)).to.deep.equal({
-      config: [41, 1, 8, 0],
-      samplerate: 64000,
-      channelCount: 0,
-      codec: 'mp4a.40.5',
+    const result = getAudioConfig(observer, data, 0, undefined);
+    expect(result, JSON.stringify(result)).to.deep.equal({
+      config: [19, 144],
+      samplerate: 22050,
+      channelCount: 2,
+      codec: 'mp4a.40.2',
+      parsedCodec: 'mp4a.40.2',
       manifestCodec: undefined,
     });
   });
 
-  it('should return audio config for Chrome if audio codec is "mp4a.40.5"', function () {
-    const observer = {
-      trigger: sinon.stub(navigator, 'userAgent').get(() => 'Chrome'),
-    };
+  it('should return audio config for mono audio', function () {
+    const observer = new EventEmitter();
     const data = new Uint8Array(new ArrayBuffer(4));
     data[0] = 0xff;
-    data[1] = 0xf0; // ID = 0 (MPEG-4), layer = 00, protection_absent = 0
-    data[2] = 0x28; // sampling_frequency_index = 10
+    data[1] = 0xf1; // ID = 0 (MPEG-4), layer = 00
+    data[2] = 0x50; // sampling_frequency_index = 4
+    data[3] = 0x40; // mono channels
 
-    expect(getAudioConfig(observer, data, 0, 'mp4a.40.5')).to.deep.equal({
-      config: [45, 3, 136, 0],
-      samplerate: 11025,
-      channelCount: 0,
-      codec: 'mp4a.40.5',
-      manifestCodec: 'mp4a.40.5',
-    });
-  });
-
-  it('should return audio config for Chrome if audio codec is "mp4a.40.2"', function () {
-    const observer = {
-      trigger: sinon.stub(navigator, 'userAgent').get(() => 'Chrome'),
-    };
-    const data = new Uint8Array(new ArrayBuffer(4));
-    data[0] = 0xff;
-    data[1] = 0xf0; // ID = 0 (MPEG-4), layer = 00, protection_absent = 0
-    data[2] = 0x28; // sampling_frequency_index = 10
-    data[3] = 0x40; // channel = 1
-
-    expect(getAudioConfig(observer, data, 0, 'mp4a.40.2')).to.deep.equal({
-      config: [21, 8],
-      samplerate: 11025,
+    const result = getAudioConfig(observer, data, 0, undefined);
+    expect(result, JSON.stringify(result)).to.deep.equal({
+      config: [18, 8],
+      samplerate: 44100,
       channelCount: 1,
       codec: 'mp4a.40.2',
-      manifestCodec: 'mp4a.40.2',
+      parsedCodec: 'mp4a.40.2',
+      manifestCodec: undefined,
     });
   });
 
-  it('should return audio config for Vivaldi', function () {
-    const observer = {
-      trigger: sinon.stub(navigator, 'userAgent').get(() => 'Vivaldi'),
-    };
+  it('should keep AAC Main (object type 1) with high sample rate as mp4a.40.1', function () {
+    const observer = new EventEmitter();
     const data = new Uint8Array(new ArrayBuffer(4));
     data[0] = 0xff;
     data[1] = 0xf0; // ID = 0 (MPEG-4), layer = 00, protection_absent = 0
     data[2] = 0x08; // sampling_frequency_index = 2
 
-    expect(getAudioConfig(observer, data, 0, 'mp4a.40.2')).to.deep.equal({
-      config: [17, 0],
+    const result = getAudioConfig(observer, data, 0, undefined);
+    expect(result, JSON.stringify(result)).to.deep.equal({
+      config: [9, 0],
       samplerate: 64000,
       channelCount: 0,
-      codec: 'mp4a.40.2',
-      manifestCodec: 'mp4a.40.2',
+      codec: 'mp4a.40.1',
+      parsedCodec: 'mp4a.40.1',
+      manifestCodec: undefined,
     });
   });
 });
@@ -340,7 +291,7 @@ describe('initTrackConfig', function () {
     });
   });
 
-  it('should call `getAudioConfig` and change track if track.samplerate is undefined', function () {
+  it('should set track config with implicit HE-AAC for AAC Main with low sample rate', function () {
     const track = {};
     const observer = {
       trigger: sinon.spy(),
@@ -357,6 +308,7 @@ describe('initTrackConfig', function () {
       samplerate: 11025,
       channelCount: 0,
       codec: 'mp4a.40.5',
+      parsedCodec: 'mp4a.40.5',
       manifestCodec: 'mp4a.40.29',
     });
   });
@@ -374,33 +326,23 @@ describe('parseFrameHeader', function () {
     data[0] = 0xff;
     data[1] = 0xf0; // protection_absent = 0
     data[4] = 0x02; // frame_length is 16
-    expect(parseFrameHeader(data, 0, 0, 0, 0)).to.deep.equal({
+    expect(parseFrameHeader(data, 0)).to.deep.equal({
       headerLength: 9,
       frameLength: 7,
-      stamp: 0,
     });
   });
 
-  it('should return undefined if there is only the header part', function () {
-    const data = new Uint8Array(new ArrayBuffer(9));
-    data[0] = 0xff;
-    data[1] = 0xf0; // protection_absent = 0
-    data[4] = 0x01;
-    data[5] = 0x40; // frame_length is 9
-    expect(parseFrameHeader(data, 0, 0, 0, 0)).to.be.undefined;
-  });
-
-  it('should return undefined if data does not contain the entire frame', function () {
+  it('should return undefined if frame length is 0', function () {
     const data = new Uint8Array(new ArrayBuffer(12));
     data[0] = 0xff;
     data[1] = 0xf0; // protection_absent = 0
-    data[4] = 0x02; // frame_length is 16
-    expect(parseFrameHeader(data, 0, 0, 0, 0)).to.be.undefined;
+    data[4] = 0x00; // frame_length is 0
+    expect(parseFrameHeader(data, 0)).to.be.undefined;
   });
 });
 
 describe('appendFrame', function () {
-  it('should append the found sample to track and return some useful information', function () {
+  it('should append the found sample to track and return frame information', function () {
     const track = {
       samplerate: 64000,
       samples: [],
@@ -411,29 +353,66 @@ describe('appendFrame', function () {
     data[1] = 0xf0; // protection_absent = 0
     data[4] = 0x02; // frame_length is 16
 
-    expect(appendFrame(track, data, 0, 0, 0)).to.deep.equal({
+    const frame = appendFrame(track, data, 0, 0, 0);
+    expect(frame, JSON.stringify(frame)).to.deep.equal({
       sample: {
         unit: data.subarray(9, 16),
         pts: 0,
-        dts: 0,
       },
       length: 16,
+      missing: 0,
     });
     expect(track.samples.length).to.equal(1);
   });
 
-  it('should not append sample if `parseFrameHeader` fails', function () {
+  it('should return an incomplete frame without appending when data is incomplete (aac overflow or progressive streaming)', function () {
     const track = {
       samplerate: 64000,
       samples: [],
       len: 0,
     };
-    const data = new Uint8Array(new ArrayBuffer(12));
+    const data = new Uint8Array(new ArrayBuffer(20));
     data[0] = 0xff;
     data[1] = 0xf0; // protection_absent = 0
-    data[4] = 0x02; // frame_length is 16
+    data[4] = 0x03; // frame_length is 24
 
-    expect(appendFrame(track, data, 0, 0, 0)).to.be.undefined;
+    const frame = appendFrame(track, data, 0, 0, 0);
+    const unit = new Uint8Array(15);
+    unit.set(data.subarray(9, 20), 0);
+
+    expect(frame, JSON.stringify(frame)).to.deep.equal({
+      sample: {
+        unit,
+        pts: 0,
+      },
+      length: 24,
+      missing: 4,
+    });
+    expect(track.samples.length).to.equal(0);
+  });
+
+  it('should return an incomplete frame without appending when header is incomplete (aac overflow or progressive streaming)', function () {
+    const track = {
+      samplerate: 64000,
+      samples: [],
+      len: 0,
+    };
+    const data = new Uint8Array(new ArrayBuffer(2));
+    data[0] = 0xff;
+    data[1] = 0xf0; // protection_absent = 0
+
+    const frame = appendFrame(track, data, 0, 0, 0);
+    const unit = new Uint8Array(2);
+    unit.set(data.subarray(0, 2), 0);
+
+    expect(frame, JSON.stringify(frame)).to.deep.equal({
+      sample: {
+        unit,
+        pts: 0,
+      },
+      length: 2,
+      missing: -1,
+    });
     expect(track.samples.length).to.equal(0);
   });
 });

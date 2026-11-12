@@ -1,34 +1,28 @@
-import { logger } from './logger';
-
+import { adjustSliding } from './level-helper';
+import type { ILogger } from './logger';
 import type { Fragment } from '../loader/fragment';
 import type { LevelDetails } from '../loader/level-details';
-import type { Level } from '../types/level';
-import type { RequiredProperties } from '../types/general';
-import { adjustSliding } from '../controller/level-helper';
 
-export function findFirstFragWithCC(fragments: Fragment[], cc: number) {
-  let firstFrag: Fragment | null = null;
-
+export function findFirstFragWithCC(
+  fragments: Fragment[],
+  cc: number,
+): Fragment | null {
   for (let i = 0, len = fragments.length; i < len; i++) {
-    const currentFrag = fragments[i];
-    if (currentFrag && currentFrag.cc === cc) {
-      firstFrag = currentFrag;
-      break;
+    if (fragments[i]?.cc === cc) {
+      return fragments[i];
     }
   }
-
-  return firstFrag;
+  return null;
 }
 
 export function shouldAlignOnDiscontinuities(
-  lastFrag: Fragment | null,
-  lastLevel: Level,
-  details: LevelDetails
-): lastLevel is RequiredProperties<Level, 'details'> {
-  if (lastLevel.details) {
+  refDetails: LevelDetails | undefined,
+  details: LevelDetails,
+): refDetails is LevelDetails & boolean {
+  if (refDetails) {
     if (
-      details.endCC > details.startCC ||
-      (lastFrag && lastFrag.cc < details.startCC)
+      details.startCC < refDetails.endCC &&
+      details.endCC > refDetails.startCC
     ) {
       return true;
     }
@@ -36,35 +30,9 @@ export function shouldAlignOnDiscontinuities(
   return false;
 }
 
-// Find the first frag in the previous level which matches the CC of the first frag of the new level
-export function findDiscontinuousReferenceFrag(
-  prevDetails: LevelDetails,
-  curDetails: LevelDetails
-) {
-  const prevFrags = prevDetails.fragments;
-  const curFrags = curDetails.fragments;
-
-  if (!curFrags.length || !prevFrags.length) {
-    logger.log('No fragments to align');
-    return;
-  }
-
-  const prevStartFrag = findFirstFragWithCC(prevFrags, curFrags[0].cc);
-
-  if (!prevStartFrag || (prevStartFrag && !prevStartFrag.startPTS)) {
-    logger.log('No frag in previous level to align on');
-    return;
-  }
-
-  return prevStartFrag;
-}
-
 function adjustFragmentStart(frag: Fragment, sliding: number) {
-  if (frag) {
-    const start = frag.start + sliding;
-    frag.start = frag.startPTS = start;
-    frag.endPTS = start + frag.duration;
-  }
+  const start = frag.start + sliding;
+  frag.setStart(start);
 }
 
 export function adjustSlidingStart(sliding: number, details: LevelDetails) {
@@ -86,90 +54,121 @@ export function adjustSlidingStart(sliding: number, details: LevelDetails) {
  * The PTS of a fragment lets Hls.js know where it fits into a stream - by knowing every PTS, we know which fragment to
  * download at any given time. PTS is normally computed when the fragment is demuxed, so taking this step saves us time
  * and an extra download.
- * @param lastFrag
  * @param lastLevel
  * @param details
  */
 export function alignStream(
-  lastFrag: Fragment | null,
-  lastLevel: Level | null,
-  details: LevelDetails
+  switchDetails: LevelDetails | undefined,
+  details: LevelDetails,
+  logger: ILogger,
 ) {
-  if (!lastLevel) {
+  if (!switchDetails) {
     return;
   }
-  alignDiscontinuities(lastFrag, details, lastLevel);
-  if (!details.alignedSliding && lastLevel.details) {
+  alignDiscontinuities(details, switchDetails, logger);
+  if (!details.alignedSliding) {
     // If the PTS wasn't figured out via discontinuity sequence that means there was no CC increase within the level.
     // Aligning via Program Date Time should therefore be reliable, since PDT should be the same within the same
     // discontinuity sequence.
-    alignPDT(details, lastLevel.details);
+    alignMediaPlaylistByPDT(details, switchDetails, logger);
   }
-  if (
-    !details.alignedSliding &&
-    lastLevel.details &&
-    !details.skippedSegments
-  ) {
+  if (!details.alignedSliding && !details.skippedSegments) {
     // Try to align on sn so that we pick a better start fragment.
     // Do not perform this on playlists with delta updates as this is only to align levels on switch
     // and adjustSliding only adjusts fragments after skippedSegments.
-    adjustSliding(lastLevel.details, details);
+    adjustSliding(switchDetails, details, false, logger);
   }
 }
 
 /**
- * Computes the PTS if a new level's fragments using the PTS of a fragment in the last level which shares the same
- * discontinuity sequence.
- * @param lastFrag - The last Fragment which shares the same discontinuity sequence
+ * Ajust the start of fragments in `details` by the difference in time between fragments of the latest
+ * shared discontinuity sequence change.
  * @param lastLevel - The details of the last loaded level
  * @param details - The details of the new level
  */
-function alignDiscontinuities(
-  lastFrag: Fragment | null,
+export function alignDiscontinuities(
   details: LevelDetails,
-  lastLevel: Level
+  refDetails: LevelDetails | undefined,
+  logger: ILogger,
 ) {
-  if (shouldAlignOnDiscontinuities(lastFrag, lastLevel, details)) {
-    const referenceFrag = findDiscontinuousReferenceFrag(
-      lastLevel.details,
-      details
-    );
-    if (referenceFrag && Number.isFinite(referenceFrag.start)) {
-      logger.log(
-        `Adjusting PTS using last level due to CC increase within current level ${details.url}`
-      );
-      adjustSlidingStart(referenceFrag.start, details);
-    }
+  if (!shouldAlignOnDiscontinuities(refDetails, details)) {
+    return;
   }
+  const targetCC = Math.min(refDetails.endCC, details.endCC);
+  const refFrag = findFirstFragWithCC(refDetails.fragments, targetCC);
+  const frag = findFirstFragWithCC(details.fragments, targetCC);
+  if (!refFrag || !frag) {
+    return;
+  }
+  const delta = refFrag.start - frag.start;
+  logger.log(
+    `Aligning playlists using dicontinuity sequence ${targetCC} (diff: ${delta})`,
+  );
+  adjustSlidingStart(delta, details);
 }
 
 /**
- * Computes the PTS of a new level's fragments using the difference in Program Date Time from the last level.
- * @param details - The details of the new level
- * @param lastDetails - The details of the last loaded level
+ * Ensures appropriate time-alignment between renditions based on PDT.
+ * This function assumes the timelines represented in `refDetails` are accurate, including the PDTs
+ * for the last discontinuity sequence number shared by both playlists when present,
+ * and uses the "wallclock"/PDT timeline as a cross-reference to `details`, adjusting the presentation
+ * times/timelines of `details` accordingly.
+ * Given the asynchronous nature of fetches and initial loads of live `main` and audio/subtitle tracks,
+ * the primary purpose of this function is to ensure the "local timelines" of audio/subtitle tracks
+ * are aligned to the main/video timeline, using PDT as the cross-reference/"anchor" that should
+ * be consistent across playlists, per the HLS spec.
+ * @param details - The details of the rendition you'd like to time-align (e.g. an audio rendition).
+ * @param refDetails - The details of the reference rendition with start and PDT times for alignment.
  */
-export function alignPDT(details: LevelDetails, lastDetails: LevelDetails) {
-  // This check protects the unsafe "!" usage below for null program date time access.
-  if (
-    !lastDetails.fragments.length ||
-    !details.hasProgramDateTime ||
-    !lastDetails.hasProgramDateTime
-  ) {
+export function alignMediaPlaylistByPDT(
+  details: LevelDetails,
+  refDetails: LevelDetails,
+  logger: ILogger,
+) {
+  if (!details.hasProgramDateTime || !refDetails.hasProgramDateTime) {
     return;
   }
-  // if last level sliding is 1000 and its first frag PROGRAM-DATE-TIME is 2017-08-20 1:10:00 AM
-  // and if new details first frag PROGRAM DATE-TIME is 2017-08-20 1:10:08 AM
-  // then we can deduce that playlist B sliding is 1000+8 = 1008s
-  const lastPDT = lastDetails.fragments[0].programDateTime!; // hasProgramDateTime check above makes this safe.
-  const newPDT = details.fragments[0].programDateTime!;
-  // date diff is in ms. frag.start is in seconds
-  const sliding = (newPDT - lastPDT) / 1000 + lastDetails.fragments[0].start;
-  if (sliding && Number.isFinite(sliding)) {
-    logger.log(
-      `Adjusting PTS using programDateTime delta ${
-        newPDT - lastPDT
-      }ms, sliding:${sliding.toFixed(3)} ${details.url} `
-    );
-    adjustSlidingStart(sliding, details);
+
+  const fragments = details.fragments;
+  const refFragments = refDetails.fragments;
+  if (!fragments.length || !refFragments.length) {
+    return;
   }
+
+  // Calculate a delta to apply to all fragments according to the delta in PDT times and start times
+  // of a fragment in the reference details, and a fragment in the target details of the same discontinuity.
+  // If a fragment of the same discontinuity was not found use the middle fragment of both.
+  let refFrag: Fragment | null | undefined;
+  let frag: Fragment | null | undefined;
+  const targetCC = Math.min(refDetails.endCC, details.endCC);
+  if (refDetails.startCC < targetCC && details.startCC < targetCC) {
+    refFrag = findFirstFragWithCC(refFragments, targetCC);
+    frag = findFirstFragWithCC(fragments, targetCC);
+  }
+  if (!refFrag || !frag) {
+    refFrag =
+      refFragments[Math.floor(refFragments.length / 2)] ||
+      refFragments.filter((f) => !!f)[0];
+    frag =
+      findFirstFragWithCC(fragments, refFrag.cc) ||
+      fragments[Math.floor(fragments.length / 2)];
+  }
+  const refPDT = refFrag.programDateTime;
+  const targetPDT = frag.programDateTime;
+  if (!refPDT || !targetPDT) {
+    return;
+  }
+
+  const dateDifference = (targetPDT - refPDT) / 1000;
+  if (Math.abs(dateDifference) > Math.max(60, details.totalduration)) {
+    // Do not align on PDT if ranges differ significantly
+    logger.log(
+      `Cannot align playlists using PDT without overlap (${Math.abs(dateDifference)} > ${details.totalduration})`,
+    );
+    return;
+  }
+
+  const delta = dateDifference - (frag.start - refFrag.start);
+  logger.log(`Aligning playlists using PDT (diff: ${delta})`);
+  adjustSlidingStart(delta, details);
 }

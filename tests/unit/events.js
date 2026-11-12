@@ -1,3 +1,4 @@
+import { expect } from 'chai';
 import { Events } from '../../src/events';
 
 function getAllCapsSnakeCaseToCamelCase(eventType) {
@@ -30,7 +31,7 @@ describe('Events tests', function () {
           const value = Events[event];
           const expected = 'hls' + getAllCapsSnakeCaseToCamelCase(event);
           expect(value).to.equal(expected);
-        }
+        },
       );
     });
   });

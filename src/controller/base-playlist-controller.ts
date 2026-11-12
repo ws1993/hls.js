@@ -1,156 +1,288 @@
+import { NetworkErrorAction } from './error-controller';
+import { ErrorDetails, ErrorTypes } from '../errors';
+import { Events } from '../events';
+import {
+  getSkipValue,
+  HlsSkip,
+  HlsUrlParameters,
+  type Level,
+} from '../types/level';
+import {
+  getRetryDelay,
+  isTimeoutError,
+  offlineHttpStatus,
+} from '../utils/error-helper';
+import { computeReloadInterval, mergeDetails } from '../utils/level-helper';
+import { Logger } from '../utils/logger';
 import type Hls from '../hls';
-import type { NetworkComponentAPI } from '../types/component-api';
-import { getSkipValue, HlsSkip, HlsUrlParameters } from '../types/level';
-import { computeReloadInterval } from './level-helper';
-import { logger } from '../utils/logger';
 import type { LevelDetails } from '../loader/level-details';
-import type { MediaPlaylist } from '../types/media-playlist';
+import type { NetworkComponentAPI } from '../types/component-api';
+import type { ErrorData } from '../types/events';
 import type {
   AudioTrackLoadedData,
   LevelLoadedData,
   TrackLoadedData,
 } from '../types/events';
-import { ErrorData } from '../types/events';
-import * as LevelHelper from './level-helper';
-import { Events } from '../events';
-import { ErrorTypes } from '../errors';
+import type { MediaPlaylist } from '../types/media-playlist';
 
-export default class BasePlaylistController implements NetworkComponentAPI {
+export default class BasePlaylistController
+  extends Logger
+  implements NetworkComponentAPI
+{
   protected hls: Hls;
-  protected timer: number = -1;
   protected canLoad: boolean = false;
-  protected retryCount: number = 0;
-  protected log: (msg: any) => void;
-  protected warn: (msg: any) => void;
+  private timer: number = -1;
+  private loadingSync: boolean = false;
 
   constructor(hls: Hls, logPrefix: string) {
-    this.log = logger.log.bind(logger, `${logPrefix}:`);
-    this.warn = logger.warn.bind(logger, `${logPrefix}:`);
+    super(logPrefix, hls.logger);
     this.hls = hls;
   }
 
-  public destroy(): void {
+  public destroy() {
     this.clearTimer();
     // @ts-ignore
-    this.hls = this.log = this.warn = null;
+    this.hls = null;
   }
 
-  protected onError(event: Events.ERROR, data: ErrorData): void {
-    if (data.fatal && data.type === ErrorTypes.NETWORK_ERROR) {
-      this.clearTimer();
+  private clearTimer() {
+    if (this.timer !== -1) {
+      self.clearTimeout(this.timer);
+      this.timer = -1;
     }
   }
 
-  protected clearTimer(): void {
-    clearTimeout(this.timer);
-    this.timer = -1;
-  }
-
-  public startLoad(): void {
+  public startLoad() {
     this.canLoad = true;
-    this.retryCount = 0;
     this.loadPlaylist();
   }
 
-  public stopLoad(): void {
+  public stopLoad() {
     this.canLoad = false;
     this.clearTimer();
   }
 
   protected switchParams(
     playlistUri: string,
-    previous?: LevelDetails
+    previous: LevelDetails | undefined,
+    current: LevelDetails | undefined,
   ): HlsUrlParameters | undefined {
     const renditionReports = previous?.renditionReports;
     if (renditionReports) {
+      let foundIndex = -1;
       for (let i = 0; i < renditionReports.length; i++) {
         const attr = renditionReports[i];
-        const uri = '' + attr.URI;
-        if (uri === playlistUri.substr(-uri.length)) {
-          const msn = parseInt(attr['LAST-MSN']);
-          let part = parseInt(attr['LAST-PART']);
-          if (previous && this.hls.config.lowLatencyMode) {
-            const currentGoal = Math.min(
-              previous.age - previous.partTarget,
-              previous.targetduration
-            );
-            if (part !== undefined && currentGoal > previous.partTarget) {
-              part += 1;
-            }
-          }
-          if (Number.isFinite(msn)) {
-            return new HlsUrlParameters(
-              msn,
-              Number.isFinite(part) ? part : undefined,
-              HlsSkip.No
-            );
+        let uri: string;
+        try {
+          uri = new self.URL(attr.URI, previous.url).href;
+        } catch (error) {
+          this.warn(
+            `Could not construct new URL for Rendition Report: ${error}`,
+          );
+          uri = attr.URI || '';
+        }
+        // Use exact match. Otherwise, the last partial match, if any, will be used
+        // (Playlist URI includes a query string that the Rendition Report does not)
+        if (uri === playlistUri) {
+          foundIndex = i;
+          break;
+        } else if (uri === playlistUri.substring(0, uri.length)) {
+          foundIndex = i;
+        }
+      }
+      if (foundIndex !== -1) {
+        const attr = renditionReports[foundIndex];
+        const msn = parseInt(attr['LAST-MSN']) || previous.lastPartSn;
+        let part = parseInt(attr['LAST-PART']) || previous.lastPartIndex;
+        if (this.hls.config.lowLatencyMode) {
+          const currentGoal = Math.min(
+            previous.age - previous.partTarget,
+            previous.targetduration,
+          );
+          if (part >= 0 && currentGoal > previous.partTarget) {
+            part += 1;
           }
         }
+        const skip = current && getSkipValue(current);
+        return new HlsUrlParameters(msn, part >= 0 ? part : undefined, skip);
       }
     }
   }
 
-  protected loadPlaylist(hlsUrlParameters?: HlsUrlParameters): void {}
+  protected loadPlaylist(hlsUrlParameters?: HlsUrlParameters) {
+    // Loading is handled by the subclasses
+    this.clearTimer();
+  }
 
-  protected shouldLoadTrack(track: MediaPlaylist): boolean {
+  protected loadingPlaylist(
+    playlist: Level | MediaPlaylist,
+    hlsUrlParameters?: HlsUrlParameters,
+  ) {
+    // Loading is handled by the subclasses
+    this.clearTimer();
+  }
+
+  protected shouldLoadPlaylist(
+    playlist: Level | MediaPlaylist | null | undefined,
+  ): playlist is Level | MediaPlaylist {
     return (
       this.canLoad &&
-      track &&
-      !!track.url &&
-      (!track.details || track.details.live)
+      !!playlist &&
+      !!playlist.url &&
+      (!playlist.details || playlist.details.live)
     );
+  }
+
+  protected getUrlWithDirectives(
+    uri: string,
+    hlsUrlParameters: HlsUrlParameters | undefined,
+  ): string {
+    if (hlsUrlParameters) {
+      try {
+        return hlsUrlParameters.addDirectives(uri);
+      } catch (error) {
+        this.warn(
+          `Could not construct new URL with HLS Delivery Directives: ${error}`,
+        );
+      }
+    }
+    return uri;
   }
 
   protected playlistLoaded(
     index: number,
     data: LevelLoadedData | AudioTrackLoadedData | TrackLoadedData,
-    previousDetails?: LevelDetails
+    previousDetails?: LevelDetails,
   ) {
     const { details, stats } = data;
+    const fragments = details.fragments;
 
     // Set last updated date-time
-    const elapsed = stats.loading.end
-      ? Math.max(0, self.performance.now() - stats.loading.end)
+    const now = self.performance.now();
+    const elapsed = stats.loading.first
+      ? Math.max(0, Math.floor(now - stats.loading.first))
       : 0;
     details.advancedDateTime = Date.now() - elapsed;
 
+    // shift fragment starts with timelineOffset
+    const timelineOffset = this.hls.config.timelineOffset;
+    if (timelineOffset !== details.appliedTimelineOffset) {
+      const offset = Math.max(timelineOffset || 0, 0);
+      details.appliedTimelineOffset = offset;
+      fragments.forEach((frag) => {
+        frag?.setStart(frag.playlistOffset + offset);
+      });
+    }
+
     // if current playlist is a live playlist, arm a timer to reload it
     if (details.live || previousDetails?.live) {
+      const levelOrTrack = 'levelInfo' in data ? data.levelInfo : data.track;
       details.reloaded(previousDetails);
-      if (previousDetails) {
-        this.log(
-          `live playlist ${index} ${
-            details.advanced
-              ? 'REFRESHED ' + details.lastPartSn + '-' + details.lastPartIndex
-              : 'MISSED'
-          }`
+      const parent = fragments[fragments.length - 1]?.type;
+
+      // TODO: consider a separate flow for low-latency blocking reload requests with delivery directives
+      if (details.misses >= this.hls.config.liveMaxUnchangedPlaylistRefresh) {
+        const error = new Error(
+          `${parent} playlist ${levelOrTrack.id} hit max allowed unchanged reloads.`,
         );
+        this.warn(error);
+        const { networkDetails, context } = data;
+        this.hls.trigger(Events.ERROR, {
+          type: ErrorTypes.NETWORK_ERROR,
+          details: ErrorDetails.PLAYLIST_UNCHANGED_ERROR,
+          fatal: false,
+          url: details.url,
+          error,
+          reason: error.message,
+          level: (data as LevelLoadedData).level,
+          parent,
+          context,
+          networkDetails,
+          stats,
+        });
+        return;
       }
+
       // Merge live playlists to adjust fragment starts and fill in delta playlist skipped segments
-      if (previousDetails && details.fragments.length > 0) {
-        LevelHelper.mergeDetails(previousDetails, details);
-        if (!details.advanced) {
-          details.advancedDateTime = previousDetails.advancedDateTime;
+      if (previousDetails) {
+        mergeDetails(previousDetails, details, this);
+        const error = details.playlistParsingError;
+        if (error) {
+          this.warn(error);
+          const hls = this.hls;
+          if (!hls.config.ignorePlaylistParsingErrors) {
+            const { networkDetails } = data;
+            hls.trigger(Events.ERROR, {
+              type: ErrorTypes.NETWORK_ERROR,
+              details: ErrorDetails.LEVEL_PARSING_ERROR,
+              fatal: false,
+              url: details.url,
+              error,
+              reason: error.message,
+              level: (data as LevelLoadedData).level,
+              parent,
+              networkDetails,
+              stats,
+            });
+            return;
+          }
+          details.playlistParsingError = null;
         }
       }
+      if (details.requestScheduled === -1) {
+        details.requestScheduled = stats.loading.start;
+      }
+      const bufferInfo = this.hls.mainForwardBufferInfo;
+      const position = bufferInfo ? bufferInfo.end - bufferInfo.len : 0;
+      const distanceToLiveEdgeMs = (details.edge - position) * 1000;
+      const reloadInterval = computeReloadInterval(
+        details,
+        distanceToLiveEdgeMs,
+      );
+      if (details.requestScheduled + reloadInterval < now) {
+        details.requestScheduled = now;
+      } else if (details.requestScheduled <= now) {
+        details.requestScheduled += reloadInterval;
+      }
+      const requestedHls = data.deliveryDirectives;
+      this.log(
+        `live playlist ${index} ${
+          details.advanced
+            ? `REFRESHED ${details.lastPartSn} - ${details.lastPartIndex}`
+            : details.updated
+              ? 'UPDATED'
+              : `MISSED (received ${details.lastPartSn} - ${details.lastPartIndex}${
+                  requestedHls
+                    ? ` | requested ${requestedHls.msn} - ${requestedHls.part}`
+                    : ''
+                })`
+        }`,
+      );
       if (!this.canLoad || !details.live) {
         return;
       }
-      if (details.canBlockReload && details.endSN && details.advanced) {
+      let deliveryDirectives: HlsUrlParameters | undefined;
+      let msn: number | undefined = undefined;
+      let part: number | undefined = undefined;
+      if (details.canBlockReload && details.advanced) {
         // Load level with LL-HLS delivery directives
         const lowLatencyMode = this.hls.config.lowLatencyMode;
+        const lastPartSn = details.lastPartSn;
+        const endSn = details.endSN;
         const lastPartIndex = details.lastPartIndex;
-        let msn;
-        let part;
-        if (lowLatencyMode) {
-          msn = lastPartIndex !== -1 ? details.lastPartSn : details.endSN + 1;
-          part = lastPartIndex !== -1 ? lastPartIndex + 1 : undefined;
+        const hasParts = lastPartIndex !== -1;
+        const atLastPartOfSegment = lastPartSn === endSn;
+        if (hasParts) {
+          // When low latency mode is disabled, request the last part of the next segment
+          if (atLastPartOfSegment) {
+            msn = endSn + 1;
+            part = lowLatencyMode ? 0 : lastPartIndex;
+          } else {
+            msn = lastPartSn;
+            part = lowLatencyMode ? lastPartIndex + 1 : details.maxPartIndex;
+          }
         } else {
-          // This playlist update will be late by one part (0). There is no way to know the last part number,
-          // or request just the next sn without a part in most implementations.
-          msn =
-            lastPartIndex !== -1 ? details.lastPartSn + 1 : details.endSN + 1;
-          part = lastPartIndex !== -1 ? 0 : undefined;
+          msn = endSn + 1;
         }
         // Low-Latency CDN Tune-in: "age" header and time since load indicates we're behind by more than one part
         // Update directives to obtain the Playlist that has the estimated additional duration of media
@@ -158,14 +290,26 @@ export default class BasePlaylistController implements NetworkComponentAPI {
         const cdnAge = lastAdvanced + details.ageHeader;
         let currentGoal = Math.min(
           cdnAge - details.partTarget,
-          details.targetduration * 1.5
+          details.targetduration * 1.5,
         );
         if (currentGoal > 0) {
-          if (previousDetails && currentGoal > previousDetails.tuneInGoal) {
+          if (cdnAge > details.targetduration * 3) {
+            // Omit segment and part directives when the last response was more than 3 target durations ago,
+            this.log(
+              `Playlist last advanced ${lastAdvanced.toFixed(
+                2,
+              )}s ago. Omitting segment and part directives.`,
+            );
+            msn = undefined;
+            part = undefined;
+          } else if (
+            previousDetails?.tuneInGoal &&
+            cdnAge - details.partTarget > previousDetails.tuneInGoal
+          ) {
             // If we attempted to get the next or latest playlist update, but currentGoal increased,
             // then we either can't catchup, or the "age" header cannot be trusted.
             this.warn(
-              `CDN Tune-in goal increased from: ${previousDetails.tuneInGoal} to: ${currentGoal} with playlist age: ${details.age}`
+              `CDN Tune-in goal increased from: ${previousDetails.tuneInGoal} to: ${currentGoal} with playlist age: ${details.age}`,
             );
             currentGoal = 0;
           } else {
@@ -173,7 +317,7 @@ export default class BasePlaylistController implements NetworkComponentAPI {
             msn += segments;
             if (part !== undefined) {
               const parts = Math.round(
-                (currentGoal % details.targetduration) / details.partTarget
+                (currentGoal % details.targetduration) / details.partTarget,
               );
               part += parts;
             }
@@ -181,66 +325,145 @@ export default class BasePlaylistController implements NetworkComponentAPI {
               `CDN Tune-in age: ${
                 details.ageHeader
               }s last advanced ${lastAdvanced.toFixed(
-                2
-              )}s goal: ${currentGoal} skip sn ${segments} to part ${part}`
+                2,
+              )}s goal: ${currentGoal} skip sn ${segments} to part ${part}`,
             );
           }
           details.tuneInGoal = currentGoal;
         }
-        let skip = getSkipValue(details, msn);
-        if (data.deliveryDirectives?.skip) {
-          if (details.deltaUpdateFailed) {
-            msn = data.deliveryDirectives.msn;
-            part = data.deliveryDirectives.part;
-            skip = HlsSkip.No;
-          }
+        deliveryDirectives = this.getDeliveryDirectives(
+          details,
+          data.deliveryDirectives,
+          msn,
+          part,
+        );
+        if (lowLatencyMode || !atLastPartOfSegment) {
+          details.requestScheduled = now;
+          this.loadingPlaylist(levelOrTrack, deliveryDirectives);
+          return;
         }
-        this.loadPlaylist(new HlsUrlParameters(msn, part, skip));
-        return;
+      } else if (details.canBlockReload || details.canSkipUntil) {
+        deliveryDirectives = this.getDeliveryDirectives(
+          details,
+          data.deliveryDirectives,
+          msn,
+          part,
+        );
       }
-      const reloadInterval = computeReloadInterval(details, stats);
-      this.log(
-        `reload live playlist ${index} in ${Math.round(reloadInterval)} ms`
-      );
-      this.timer = self.setTimeout(() => this.loadPlaylist(), reloadInterval);
+      if (deliveryDirectives && msn !== undefined && details.canBlockReload) {
+        details.requestScheduled =
+          stats.loading.first +
+          Math.max(reloadInterval - elapsed * 2, reloadInterval / 2);
+      }
+      this.scheduleLoading(levelOrTrack, deliveryDirectives, details);
     } else {
       this.clearTimer();
     }
   }
 
-  protected retryLoadingOrFail(errorEvent: ErrorData): boolean {
-    const { config } = this.hls;
-    const retry = this.retryCount < config.levelLoadingMaxRetry;
+  protected scheduleLoading(
+    levelOrTrack: Level | MediaPlaylist,
+    deliveryDirectives?: HlsUrlParameters,
+    updatedDetails?: LevelDetails,
+  ) {
+    const details = updatedDetails || levelOrTrack.details;
+    if (!details) {
+      this.loadingPlaylist(levelOrTrack, deliveryDirectives);
+      return;
+    }
+    const now = self.performance.now();
+    const requestScheduled = details.requestScheduled;
+    if (now >= requestScheduled && !this.loadingSync) {
+      this.loadingSync = true;
+      this.loadingPlaylist(levelOrTrack, deliveryDirectives);
+      this.loadingSync = false;
+      return;
+    }
+
+    const estimatedTimeUntilUpdate = Math.max(requestScheduled - now, 0);
+    this.log(
+      `reload live playlist ${levelOrTrack.name || levelOrTrack.bitrate + 'bps'} in ${Math.round(
+        estimatedTimeUntilUpdate,
+      )} ms`,
+    );
+
+    this.clearTimer();
+    this.timer = self.setTimeout(
+      () => this.loadingPlaylist(levelOrTrack, deliveryDirectives),
+      estimatedTimeUntilUpdate,
+    );
+  }
+
+  private getDeliveryDirectives(
+    details: LevelDetails,
+    previousDeliveryDirectives: HlsUrlParameters | null,
+    msn?: number,
+    part?: number,
+  ): HlsUrlParameters {
+    let skip = getSkipValue(details);
+    if (previousDeliveryDirectives?.skip && details.deltaUpdateFailed) {
+      msn = previousDeliveryDirectives.msn;
+      part = previousDeliveryDirectives.part;
+      skip = HlsSkip.No;
+    }
+    return new HlsUrlParameters(msn, part, skip);
+  }
+
+  protected checkRetry(errorEvent: ErrorData): boolean {
+    const errorDetails = errorEvent.details;
+    const isTimeout = isTimeoutError(errorEvent);
+    const errorAction = errorEvent.errorAction;
+    const { action, retryCount = 0, retryConfig } = errorAction || {};
+    const retry =
+      !!errorAction &&
+      !!retryConfig &&
+      (action === NetworkErrorAction.RetryRequest ||
+        (!errorAction.resolved &&
+          action === NetworkErrorAction.SendAlternateToPenaltyBox));
     if (retry) {
-      this.retryCount++;
-      if (
-        errorEvent.details.indexOf('LoadTimeOut') > -1 &&
-        errorEvent.context?.deliveryDirectives
-      ) {
+      if (retryCount >= retryConfig.maxNumRetry) {
+        return false;
+      }
+      if (isTimeout && errorEvent.context?.deliveryDirectives) {
         // The LL-HLS request already timed out so retry immediately
         this.warn(
-          `retry playlist loading #${this.retryCount} after "${errorEvent.details}"`
+          `Retrying playlist loading ${retryCount + 1}/${
+            retryConfig.maxNumRetry
+          } after "${errorDetails}" without delivery-directives`,
         );
         this.loadPlaylist();
       } else {
-        // exponential backoff capped to max retry timeout
-        const delay = Math.min(
-          Math.pow(2, this.retryCount) * config.levelLoadingRetryDelay,
-          config.levelLoadingMaxRetryTimeout
-        );
+        const offlineStatus = offlineHttpStatus(errorEvent.response?.code);
         // Schedule level/track reload
-        this.timer = self.setTimeout(() => this.loadPlaylist(), delay);
-        this.warn(
-          `retry playlist loading #${this.retryCount} in ${delay} ms after "${errorEvent.details}"`
-        );
+        this.clearTimer();
+        if (offlineStatus) {
+          this.log(`Waiting for connection (offline)`);
+          errorEvent.reason = 'offline';
+          this.timer = self.setTimeout(() => this.checkOfflineStatus(), 1000);
+        } else {
+          const delay = getRetryDelay(retryConfig, retryCount);
+          this.warn(
+            `Retrying playlist loading ${retryCount + 1}/${
+              retryConfig.maxNumRetry
+            } after "${errorDetails}" in ${delay}ms`,
+          );
+          this.timer = self.setTimeout(() => this.loadPlaylist(), delay);
+        }
       }
-    } else {
-      this.warn(`cannot recover from error "${errorEvent.details}"`);
-      // stopping live reloading timer if any
-      this.clearTimer();
-      // switch error to fatal
-      errorEvent.fatal = true;
+      // `levelRetry = true` used to inform other controllers that a retry is happening
+      errorEvent.levelRetry = true;
+      errorAction.resolved = true;
     }
     return retry;
+  }
+
+  private checkOfflineStatus() {
+    this.clearTimer();
+    if (offlineHttpStatus(0)) {
+      this.timer = self.setTimeout(() => this.checkOfflineStatus(), 1000);
+    } else {
+      this.log(`Connection restored (online)`);
+      this.loadPlaylist();
+    }
   }
 }

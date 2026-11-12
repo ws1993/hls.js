@@ -1,3 +1,14 @@
+<!-- START doctoc generated TOC please keep comment here to allow auto update -->
+<!-- DON'T EDIT THIS SECTION, INSTEAD RE-RUN doctoc TO UPDATE -->
+
+**Table of Contents**
+
+- [Design principle](#design-principle)
+- [Code structure](#code-structure)
+- [Error detection and Handling](#error-detection-and-handling)
+
+<!-- END doctoc generated TOC please keep comment here to allow auto update -->
+
 ## Design principle
 
 design idea is pretty simple :
@@ -6,7 +17,7 @@ design idea is pretty simple :
 - all subsystems are instantiated by the Hls instance.
 - each subsystem heavily relies on events for internal/external communications.
 - Events are handled using [EventEmitter3](https://github.com/primus/eventemitter3)
-- bundled for the browser by [webpack](https://webpack.js.org/)
+- bundled for the browser by [rollup](https://rollupjs.org/)
 
 ## Code structure
 
@@ -28,14 +39,14 @@ design idea is pretty simple :
 - [src/controller/audio-stream-controller.ts][]
   - audio stream controller is in charge of filling audio buffer in case alternate audio tracks are used
   - if buffer is not filled up appropriately (i.e. as per defined maximum buffer size, it will trigger the following actions:
-    - retrieve "not buffered" media position greater then current playback position. this is performed by comparing audio sourcebuffer.buffered and media.currentTime.
+    - retrieve "not buffered" media position greater than current playback position. This is performed by comparing audio `sourcebuffer.buffered` and `media.currentTime`.
     - retrieve URL of fragment matching with this media position, and appropriate audio track
     - trigger KEY_LOADING event (only if fragment is encrypted)
     - trigger FRAG_LOADING event
     - **trigger fragment demuxing** on FRAG_LOADED
     - trigger BUFFER_CODECS on FRAG_PARSING_INIT_SEGMENT
     - trigger BUFFER_APPENDING on FRAG_PARSING_DATA
-    - once FRAG_PARSED is received an all segments have been appended (BUFFER_APPENDED) then audio stream controller will recheck whether it needs to buffer more data.
+    - once FRAG_PARSED is received and all segments have been appended (BUFFER_APPENDED) then audio stream controller will recheck whether it needs to buffer more data.
 - [src/controller/audio-track-controller.ts][]
   - audio track controller is handling alternate audio track set/get ((re)loading tracks/switching)
 - [src/controller/buffer-controller.ts][]
@@ -53,7 +64,6 @@ design idea is pretty simple :
 - [src/controller/id3-track-controller.ts][]
   - in charge of creating the id3 metadata text track and adding cues to that track in response to the FRAG_PARSING_METADATA event. the raw id3 data is base64 encoded and stored in the cue's text property.
 - [src/controller/level-controller.ts][]
-
   - handling quality level set/get ((re)loading stream manifest/switching levels)
   - in charge of scheduling playlist (re)loading
   - monitors fragment and key loading errors. Performs fragment hunt by switching between primary and backup streams and down-shifting a level till `fragLoadingMaxRetry` limit is reached.
@@ -72,14 +82,13 @@ design idea is pretty simple :
   **Retry Recommendations**
 
   By not having multiple renditions, recovery logic will not be able to add extra value to your platform. In order to have good results for dual constraint media hunt, specify big enough limits for fragments and levels retries.
-
   - Level: don't use total retry less than `3 - 4`
   - Fragment: don't use total retry less than `4 - 6`
   - Implement short burst retries (i.e. small retry delay `0.5 - 4` seconds), and when library returns fatal error switch to a different CDN
 
 - [src/controller/stream-controller.ts][]
   - stream controller is in charge of:
-    - triggering BUFFER_RESET on MANIFEST_PARSED or startLoad()
+    - triggering BUFFER_RESET on MANIFEST_LOADING
     - **ensuring that media buffer is filled as per defined quality selection logic**.
   - if buffer is not filled up appropriately (i.e. as per defined maximum buffer size, or as per defined quality level), stream controller will trigger the following actions:
     - retrieve "not buffered" media position greater then current playback position. this is performed by comparing video.buffered and video.currentTime.
@@ -162,11 +171,11 @@ design idea is pretty simple :
   - tracks which parts of the buffer is not loaded correctly
   - tracks which parts of the buffer was unloaded by the coded frame eviction algorithm
 - [src/loader/fragment-loader.ts][]
-  - in charge of loading fragments, use xhr-loader if not overrided by user config
+  - in charge of loading fragments, use xhr-loader if not overridden by user config
 - [src/loader/key-loader.ts][]
   - in charge of loading decryption key
 - [src/loader/playlist-loader.ts][]
-  - in charge of loading manifest, and level playlists, use xhr-loader if not overrided by user config.
+  - in charge of loading manifest, and level playlists, use xhr-loader if not overridden by user config.
 - [src/remux/aac-helper.ts][]
   - helper class to create silent AAC frames (useful to handle streams with audio holes)
 - [src/remux/mp4-generator.ts][]
@@ -204,7 +213,7 @@ design idea is pretty simple :
   - logging utils, useful for debug
 - [src/utils/xhr-loader.ts][]
   - XmlHttpRequest wrapper. it handles standard HTTP GET but also retries and timeout.
-  - retries : if xhr fails, HTTP GET will be retried after a predetermined delay. this delay is increasing following an exponential backoff. after a predetemined max number of retries, an error callback will be triggered.
+  - retries : if xhr fails, HTTP GET will be retried after a predetermined delay. this delay is increasing following an exponential backoff. after a predetermined max number of retries, an error callback will be triggered.
   - timeout: if load exceeds max allowed duration, a timeout callback will be triggered. it is up to the callback to decides whether the connection should be cancelled or not.
 
 [src/config.ts]: ../src/config.ts
@@ -224,6 +233,7 @@ design idea is pretty simple :
 [src/controller/subtitle-stream-controller.ts]: ../src/controller/subtitle-stream-controller.ts
 [src/controller/subtitle-track-controller.ts]: ../src/controller/subtitle-track-controller.ts
 [src/controller/timeline-controller.ts]: ../src/controller/timeline-controller.ts
+[src/controller/gap-controller.ts]: ../src/controller/gap-controller.ts
 [src/crypt/aes.ts]: ../src/crypt/aes.ts
 [src/crypt/aes128-decrypter.ts]: ../src/crypt/aes128-decrypter.ts
 [src/crypt/aes-decrypter.ts]: ..src/crypt/aes-decrypter.ts
@@ -274,10 +284,7 @@ design idea is pretty simple :
 - `FRAG_LOAD_TIMEOUT` is raised by [src/loader/fragment-loader.ts][] upon xhr timeout detected by [src/utils/xhr-loader.ts][].
   - if auto level switch is enabled and loaded frag level is greater than 0, this error is not fatal: in that case [src/controller/level-controller.ts][] will trigger an emergency switch down to level 0.
   - if frag level is 0 or auto level switch is disabled, this error is marked as fatal and a call to `hls.startLoad()` could help recover it.
-  <!--
-   Deprecated in v1.0.0. Error will be raised as FRAG_PARSING_ERROR
-- `FRAG_DECRYPT_ERROR` is raised by [src/demux/tranmuxer.ts][] upon fragment decrypting error. this error is fatal.
-  -->
+- ~~`FRAG_DECRYPT_ERROR` is raised by [src/demux/tranmuxer.ts][] upon fragment decrypting error. this error is fatal.~~ _Deprecated in v1.0.0. Error will be raised as FRAG_PARSING_ERROR._
 - `FRAG_PARSING_ERROR` is raised by [src/demux/tsdemuxer.ts][] or [src/demux/adts.ts][] upon fragment parsing error. this error is not fatal.
 - `REMUX_ALLOC_ERROR` is raised by [src/remux/mp4-remuxer.ts][] upon memory allocation error while remuxing. this error is not fatal if in auto-mode and loaded frag level is greater than 0. in that case a level switch down will occur.
 - `KEY_LOAD_ERROR` is raised by [src/loader/key-loader.ts][] upon xhr failure detected by [src/utils/xhr-loader.ts][].

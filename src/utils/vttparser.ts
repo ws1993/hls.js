@@ -5,7 +5,6 @@
 import VTTCue from './vttcue';
 
 class StringDecoder {
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   decode(data: string | any, options?: Object): string | never {
     if (!data) {
       return '';
@@ -101,7 +100,7 @@ function parseOptions(
   input: string,
   callback: (k: string, v: any) => void,
   keyValueDelim: RegExp,
-  groupDelim?: RegExp
+  groupDelim?: RegExp,
 ) {
   const groups = groupDelim ? input.split(groupDelim) : [input];
   for (const i in groups) {
@@ -198,7 +197,7 @@ function parseCue(input: string, cue: VTTCue, regionList: Region[]) {
         }
       },
       /:/,
-      /\s/
+      /\s/,
     );
 
     // Apply default values for any missing fields.
@@ -221,8 +220,8 @@ function parseCue(input: string, cue: VTTCue, regionList: Region[]) {
         cue.align === 'start' || cue.align === 'left'
           ? 0
           : cue.align === 'end' || cue.align === 'right'
-          ? 100
-          : 50;
+            ? 100
+            : 50;
     }
     cue.position = position;
   }
@@ -235,13 +234,14 @@ function parseCue(input: string, cue: VTTCue, regionList: Region[]) {
   skipWhitespace();
   cue.startTime = consumeTimeStamp(); // (1) collect cue start time
   skipWhitespace();
-  if (input.substr(0, 3) !== '-->') {
+  if (input.slice(0, 3) !== '-->') {
     // (3) next characters must match '-->'
     throw new Error(
-      "Malformed time stamp (time stamps must be separated by '-->'): " + oInput
+      "Malformed time stamp (time stamps must be separated by '-->'): " +
+        oInput,
     );
   }
-  input = input.substr(3);
+  input = input.slice(3);
   skipWhitespace();
   cue.endTime = consumeTimeStamp(); // (5) collect cue end time
 
@@ -302,7 +302,7 @@ export class VTTParser {
         ++pos;
       }
 
-      const line: string = buffer.substr(0, pos);
+      const line: string = buffer.slice(0, pos);
       // Advance the buffer early in case we fail below.
       if (buffer[pos] === '\r') {
         ++pos;
@@ -312,7 +312,7 @@ export class VTTParser {
         ++pos;
       }
 
-      _this.buffer = buffer.substr(pos);
+      _this.buffer = buffer.slice(pos);
       return line;
     }
 
@@ -329,7 +329,7 @@ export class VTTParser {
           // break;
           // }
         },
-        /:/
+        /:/,
       );
     }
 
@@ -346,7 +346,7 @@ export class VTTParser {
         // strip of UTF-8 BOM if any
         // https://en.wikipedia.org/wiki/Byte_order_mark#UTF-8
         const m = line.match(/^(ï»¿)?WEBVTT([ \t].*)?$/);
-        if (!m || !m[0]) {
+        if (!m?.[0]) {
           throw new Error('Malformed WebVTT signature.');
         }
 

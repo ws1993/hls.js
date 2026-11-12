@@ -1,81 +1,173 @@
-import * as URLToolkit from 'url-toolkit';
-
-import { ErrorTypes, ErrorDetails } from './errors';
-
-import PlaylistLoader from './loader/playlist-loader';
-import KeyLoader from './loader/key-loader';
-
-import { FragmentTracker } from './controller/fragment-tracker';
-import StreamController from './controller/stream-controller';
-import LevelController from './controller/level-controller';
-
-import { isSupported } from './is-supported';
-import { logger, enableLogs } from './utils/logger';
-import { enableStreamingMode, hlsDefaultConfig, mergeConfig } from './config';
-import type { HlsConfig } from './config';
-import { Events } from './events';
+import { uuid } from '@svta/cml-utils';
 import { EventEmitter } from 'eventemitter3';
-import { Level } from './types/level';
-import type { MediaPlaylist } from './types/media-playlist';
-import AudioTrackController from './controller/audio-track-controller';
-import SubtitleTrackController from './controller/subtitle-track-controller';
-import ID3TrackController from './controller/id3-track-controller';
-import EMEController from './controller/eme-controller';
-import CapLevelController from './controller/cap-level-controller';
-import AbrController from './controller/abr-controller';
-import LatencyController from './controller/latency-controller';
-import { ComponentAPI, NetworkComponentAPI } from './types/component-api';
+import { buildAbsoluteURL } from 'url-toolkit';
+import { enableStreamingMode, hlsDefaultConfig, mergeConfig } from './config';
+import { State } from './controller/base-stream-controller';
+import { FragmentTracker } from './controller/fragment-tracker';
+import LevelController from './controller/level-controller';
+import { ErrorDetails, ErrorTypes } from './errors';
+import { Events } from './events';
+import { isMSESupported, isSupported } from './is-supported';
+import KeyLoader from './loader/key-loader';
+import PlaylistLoader from './loader/playlist-loader';
+import { MetadataSchema } from './types/demuxer';
+import { type HdcpLevel, isHdcpLevel, type Level } from './types/level';
+import { PlaylistLevelType } from './types/loader';
+import { enableLogs, type ILogger } from './utils/logger';
+import { getMediaDecodingInfoPromise } from './utils/mediacapabilities-helper';
+import { getMediaSource } from './utils/mediasource-helper';
+import { getAudioTracksByGroup } from './utils/rendition-helper';
+import { version } from './version';
+import type { HlsConfig } from './config';
+import type AbrController from './controller/abr-controller';
+import type AudioStreamController from './controller/audio-stream-controller';
+import type AudioTrackController from './controller/audio-track-controller';
+import type BasePlaylistController from './controller/base-playlist-controller';
+import type { InFlightData } from './controller/base-stream-controller';
+import type BaseStreamController from './controller/base-stream-controller';
+import type BufferController from './controller/buffer-controller';
+import type CapLevelController from './controller/cap-level-controller';
+import type CMCDController from './controller/cmcd-controller';
+import type ContentSteeringController from './controller/content-steering-controller';
+import type EMEController from './controller/eme-controller';
+import type ErrorController from './controller/error-controller';
+import type FPSController from './controller/fps-controller';
+import type GapController from './controller/gap-controller';
+import type {
+  HlsIFramesOnly,
+  HlsImageIFramesOnly,
+  IFrameController,
+} from './controller/iframe-controller';
+import type InterstitialsController from './controller/interstitials-controller';
+import type { InterstitialsManager } from './controller/interstitials-controller';
+import type LatencyController from './controller/latency-controller';
+import type StreamController from './controller/stream-controller';
+import type { SubtitleStreamController } from './controller/subtitle-stream-controller';
+import type SubtitleTrackController from './controller/subtitle-track-controller';
+import type Decrypter from './crypt/decrypter';
+import type TransmuxerInterface from './demux/transmuxer-interface';
 import type { HlsEventEmitter, HlsListeners } from './events';
-import { Fragment } from './loader/fragment';
+import type FragmentLoader from './loader/fragment-loader';
+import type { LevelDetails } from './loader/level-details';
+import type M3U8Parser from './loader/m3u8-parser';
+import type TaskLoop from './task-loop';
+import type { AttachMediaSourceData } from './types/buffer';
+import type {
+  AbrComponentAPI,
+  ComponentAPI,
+  NetworkComponentAPI,
+} from './types/component-api';
+import type { MediaAttachingData } from './types/events';
+import type { LevelParsed } from './types/level';
+import type {
+  AudioSelectionOption,
+  MediaPlaylist,
+  SubtitleSelectionOption,
+  VideoSelectionOption,
+} from './types/media-playlist';
+import type BaseLoader from './utils/base-loader';
+import type { BufferInfo, BufferTimeRange } from './utils/buffer-helper';
+import type Cues from './utils/cues';
+import type EwmaBandWidthEstimator from './utils/ewma-bandwidth-estimator';
+import type FetchLoader from './utils/fetch-loader';
+import type { MediaDecodingInfo } from './utils/mediacapabilities-helper';
+import type XhrLoader from './utils/xhr-loader';
 
 /**
- * @module Hls
- * @class
- * @constructor
+ * The `Hls` class is the core of the HLS.js library used to instantiate player instances.
+ * @public
  */
 export default class Hls implements HlsEventEmitter {
-  private static defaultConfig?: HlsConfig;
+  private static defaultConfig: HlsConfig | undefined;
 
+  /**
+   * The runtime configuration used by the player. At instantiation this is combination of `hls.userConfig` merged over `Hls.DefaultConfig`.
+   */
   public readonly config: HlsConfig;
+
+  /**
+   * The configuration object provided on player instantiation.
+   */
   public readonly userConfig: Partial<HlsConfig>;
 
+  /**
+   * The logger functions used by this player instance, configured on player instantiation.
+   */
+  public readonly logger: ILogger;
+
+  protected _url: string | null = null;
+  protected streamController: StreamController;
   private coreComponents: ComponentAPI[];
   private networkControllers: NetworkComponentAPI[];
-
   private _emitter: HlsEventEmitter = new EventEmitter();
-  private _autoLevelCapping: number;
-  private abrController: AbrController;
-  private capLevelController: CapLevelController;
-  private latencyController: LatencyController;
+  private _autoLevelCapping: number = -1;
+  private _maxHdcpLevel: HdcpLevel = null;
+  private abrController: AbrComponentAPI;
+  private bufferController?: BufferController;
+  private capLevelController?: CapLevelController;
+  private latencyController?: LatencyController;
   private levelController: LevelController;
-  private streamController: StreamController;
-  private audioTrackController: AudioTrackController;
-  private subtitleTrackController: SubtitleTrackController;
-  private emeController: EMEController;
-
+  private audioStreamController?: AudioStreamController;
+  private subtititleStreamController?: SubtitleStreamController;
+  private audioTrackController?: AudioTrackController;
+  private subtitleTrackController?: SubtitleTrackController;
+  private interstitialsController?: InterstitialsController;
+  private iframeController?: IFrameController;
+  private gapController?: GapController;
+  private emeController?: EMEController;
+  private cmcdController?: CMCDController;
   private _media: HTMLMediaElement | null = null;
-  private url: string | null = null;
+  private _sessionId?: string;
+  private triggeringException?: boolean;
+  private started: boolean = false;
 
+  /**
+   * Get the video-dev/hls.js package version.
+   */
   static get version(): string {
-    return __VERSION__;
+    return version;
   }
 
+  /**
+   * Check if the required MediaSource Extensions are available.
+   */
+  static isMSESupported(): boolean {
+    return isMSESupported();
+  }
+
+  /**
+   * Check if MediaSource Extensions are available and isTypeSupported checks pass for any baseline codecs.
+   */
   static isSupported(): boolean {
     return isSupported();
   }
 
-  static get Events() {
+  /**
+   * Get the MediaSource global used for MSE playback (ManagedMediaSource, MediaSource, or WebKitMediaSource).
+   */
+  static getMediaSource(): typeof MediaSource | undefined {
+    return getMediaSource();
+  }
+
+  static get Events(): typeof Events {
     return Events;
   }
 
-  static get ErrorTypes() {
+  static get MetadataSchema(): typeof MetadataSchema {
+    return MetadataSchema;
+  }
+
+  static get ErrorTypes(): typeof ErrorTypes {
     return ErrorTypes;
   }
 
-  static get ErrorDetails() {
+  static get ErrorDetails(): typeof ErrorDetails {
     return ErrorDetails;
   }
 
+  /**
+   * Get the default configuration applied to new instances.
+   */
   static get DefaultConfig(): HlsConfig {
     if (!Hls.defaultConfig) {
       return hlsDefaultConfig;
@@ -85,7 +177,7 @@ export default class Hls implements HlsEventEmitter {
   }
 
   /**
-   * @type {HlsConfig}
+   * Replace the default configuration applied to new instances.
    */
   static set DefaultConfig(defaultConfig: HlsConfig) {
     Hls.defaultConfig = defaultConfig;
@@ -93,101 +185,187 @@ export default class Hls implements HlsEventEmitter {
 
   /**
    * Creates an instance of an HLS client that can attach to exactly one `HTMLMediaElement`.
-   *
-   * @constructs Hls
-   * @param {HlsConfig} config
+   * @param userConfig - Configuration options applied over `Hls.DefaultConfig`
    */
   constructor(userConfig: Partial<HlsConfig> = {}) {
-    const config = (this.config = mergeConfig(Hls.DefaultConfig, userConfig));
+    const logger = (this.logger = enableLogs(
+      userConfig.debug || false,
+      'Hls instance',
+      userConfig.loggerId || userConfig.assetPlayerId,
+    ));
+    const config = (this.config = mergeConfig(
+      Hls.DefaultConfig,
+      userConfig,
+      logger,
+    ));
     this.userConfig = userConfig;
-    enableLogs(config.debug);
-
-    this._autoLevelCapping = -1;
 
     if (config.progressive) {
-      enableStreamingMode(config);
+      enableStreamingMode(config, logger);
     }
 
     // core controllers and network loaders
-    const abrController = (this.abrController = new config.abrController(this)); // eslint-disable-line new-cap
-    const bufferController = new config.bufferController(this); // eslint-disable-line new-cap
-    const capLevelController = (this.capLevelController = new config.capLevelController(
-      this
-    )); // eslint-disable-line new-cap
-    const fpsController = new config.fpsController(this); // eslint-disable-line new-cap
-    const playListLoader = new PlaylistLoader(this);
-    const keyLoader = new KeyLoader(this);
-    const id3TrackController = new ID3TrackController(this);
-
-    // network controllers
-    const levelController = (this.levelController = new LevelController(this));
+    const {
+      streamController: _StreamController,
+      abrController: _AbrController,
+      bufferController: _BufferController,
+      capLevelController: _CapLevelController,
+      errorController: _ErrorController,
+      fpsController: _FpsController,
+      id3TrackController: _ID3TrackController,
+      iframeController: _IFrameController,
+      gapController: _GapController,
+    } = config;
+    const errorController = new _ErrorController(this);
+    const abrController = (this.abrController = new _AbrController(this));
     // FragmentTracker must be defined before StreamController because the order of event handling is important
     const fragmentTracker = new FragmentTracker(this);
-    const streamController = (this.streamController = new StreamController(
+    const _InterstitialsController = config.interstitialsController;
+    const interstitialsController = _InterstitialsController
+      ? (this.interstitialsController = new _InterstitialsController(this, Hls))
+      : null;
+    const bufferController = _BufferController
+      ? (this.bufferController = new _BufferController(this, fragmentTracker))
+      : null;
+    const capLevelController = _CapLevelController
+      ? (this.capLevelController = new _CapLevelController(this))
+      : null;
+    const fpsController = _FpsController ? new _FpsController(this) : null;
+    const _CMCDController = config.cmcdController;
+    // Instantiate CMCDController before PlaylistLoader to receive Manifest Loading events first
+    const cmcdController = _CMCDController
+      ? (this.cmcdController = new _CMCDController(this))
+      : null;
+    const playListLoader = new PlaylistLoader(this);
+
+    const _ContentSteeringController = config.contentSteeringController;
+    // Instantiate ContentSteeringController before LevelController to receive Multivariant Playlist events first
+    const contentSteering = _ContentSteeringController
+      ? new _ContentSteeringController(this)
+      : null;
+    const levelController = (this.levelController = new LevelController(
       this,
-      fragmentTracker
+      contentSteering,
     ));
 
-    // Cap level controller uses streamController to flush the buffer
-    capLevelController.setStreamController(streamController);
-    // fpsController uses streamController to switch when frames are being dropped
-    fpsController.setStreamController(streamController);
+    const id3TrackController = _ID3TrackController
+      ? new _ID3TrackController(this)
+      : undefined;
 
-    const networkControllers = [levelController, streamController];
+    const keyLoader = new KeyLoader(this.config, this.logger);
+    const streamController = (this.streamController = new _StreamController(
+      this,
+      fragmentTracker,
+      keyLoader,
+    ));
+
+    const gapController = (this.gapController = _GapController
+      ? new _GapController(this, fragmentTracker)
+      : undefined);
+
+    // Cap level controller uses streamController to flush the buffer
+    if (capLevelController) {
+      capLevelController.setStreamController(streamController);
+    }
+
+    const networkControllers: NetworkComponentAPI[] = [
+      playListLoader,
+      levelController,
+      streamController,
+    ];
+    if (interstitialsController) {
+      networkControllers.splice(1, 0, interstitialsController);
+    }
+    if (contentSteering) {
+      networkControllers.splice(1, 0, contentSteering);
+    }
 
     this.networkControllers = networkControllers;
-    const coreComponents = [
-      playListLoader,
-      keyLoader,
-      abrController,
-      bufferController,
-      capLevelController,
-      fpsController,
-      id3TrackController,
-      fragmentTracker,
-    ];
+    const coreComponents: ComponentAPI[] = [abrController];
+    if (bufferController) {
+      coreComponents.push(bufferController);
+    }
+    if (gapController) {
+      coreComponents.push(gapController);
+    }
+    if (capLevelController) {
+      coreComponents.push(capLevelController);
+    }
+    if (fpsController) {
+      // fpsController uses streamController to switch when frames are being dropped
+      fpsController.setStreamController(streamController);
+      coreComponents.push(fpsController);
+    }
+    if (id3TrackController) {
+      coreComponents.push(id3TrackController);
+    }
+    coreComponents.push(fragmentTracker);
 
     this.audioTrackController = this.createController(
       config.audioTrackController,
-      null,
-      networkControllers
+      networkControllers,
     );
-    this.createController(
-      config.audioStreamController,
-      fragmentTracker,
-      networkControllers
-    );
-    // subtitleTrackController must be defined before  because the order of event handling is important
+    const AudioStreamControllerClass = config.audioStreamController;
+    if (AudioStreamControllerClass) {
+      networkControllers.push(
+        (this.audioStreamController = new AudioStreamControllerClass(
+          this,
+          fragmentTracker,
+          keyLoader,
+        )),
+      );
+    }
+    // Instantiate subtitleTrackController before SubtitleStreamController to receive level events first
     this.subtitleTrackController = this.createController(
       config.subtitleTrackController,
-      null,
-      networkControllers
+      networkControllers,
     );
-    this.createController(
-      config.subtitleStreamController,
-      fragmentTracker,
-      networkControllers
-    );
-    this.createController(config.timelineController, null, coreComponents);
-    this.emeController = this.createController(
+    const SubtitleStreamControllerClass = config.subtitleStreamController;
+    if (SubtitleStreamControllerClass) {
+      networkControllers.push(
+        (this.subtititleStreamController = new SubtitleStreamControllerClass(
+          this,
+          fragmentTracker,
+          keyLoader,
+        )),
+      );
+    }
+    this.createController(config.timelineController, coreComponents);
+    keyLoader.emeController = this.emeController = this.createController(
       config.emeController,
-      null,
-      coreComponents
+      coreComponents,
     );
+    if (cmcdController) {
+      coreComponents.push(cmcdController);
+    }
     this.latencyController = this.createController(
-      LatencyController,
-      null,
-      coreComponents
+      config.latencyController,
+      coreComponents,
     );
-
     this.coreComponents = coreComponents;
+
+    this.iframeController = _IFrameController
+      ? new _IFrameController(this, Hls)
+      : undefined;
+
+    // Error controller handles errors before and after all other controllers
+    // This listener will be invoked after all other controllers error listeners
+    networkControllers.push(errorController);
+    const onErrorOut = errorController.onErrorOut;
+    if (typeof onErrorOut === 'function') {
+      this.on(Events.ERROR, onErrorOut, errorController);
+    }
+    // Autostart load handler
+    this.on(
+      Events.MANIFEST_LOADED,
+      playListLoader.onManifestLoaded,
+      playListLoader,
+    );
   }
 
-  createController(ControllerClass, fragmentTracker, components) {
+  private createController(ControllerClass, components: ComponentAPI[]) {
     if (ControllerClass) {
-      const controllerInstance = fragmentTracker
-        ? new ControllerClass(this, fragmentTracker)
-        : new ControllerClass(this);
+      const controllerInstance = new ControllerClass(this);
       if (components) {
         components.push(controllerInstance);
       }
@@ -200,7 +378,7 @@ export default class Hls implements HlsEventEmitter {
   on<E extends keyof HlsListeners, Context = undefined>(
     event: E,
     listener: HlsListeners[E],
-    context: Context = this as any
+    context: Context = this as any,
   ) {
     this._emitter.on(event, listener, context);
   }
@@ -208,7 +386,7 @@ export default class Hls implements HlsEventEmitter {
   once<E extends keyof HlsListeners, Context = undefined>(
     event: E,
     listener: HlsListeners[E],
-    context: Context = this as any
+    context: Context = this as any,
   ) {
     this._emitter.once(event, listener, context);
   }
@@ -221,7 +399,7 @@ export default class Hls implements HlsEventEmitter {
     event: E,
     listener?: HlsListeners[E] | undefined,
     context: Context = this as any,
-    once?: boolean | undefined
+    once?: boolean | undefined,
   ) {
     this._emitter.off(event, listener, context, once);
   }
@@ -233,36 +411,42 @@ export default class Hls implements HlsEventEmitter {
   emit<E extends keyof HlsListeners>(
     event: E,
     name: E,
-    eventObject: Parameters<HlsListeners[E]>[1]
+    eventObject: Parameters<HlsListeners[E]>[1],
   ): boolean {
     return this._emitter.emit(event, name, eventObject);
   }
 
   trigger<E extends keyof HlsListeners>(
     event: E,
-    eventObject: Parameters<HlsListeners[E]>[1]
+    eventObject: Parameters<HlsListeners[E]>[1],
   ): boolean {
     if (this.config.debug) {
       return this.emit(event, event, eventObject);
     } else {
       try {
         return this.emit(event, event, eventObject);
-      } catch (e) {
-        logger.error(
+      } catch (error) {
+        this.logger.error(
           'An internal error happened while handling event ' +
             event +
             '. Error message: "' +
-            e.message +
+            error.message +
             '". Here is a stacktrace:',
-          e
+          error,
         );
-        this.trigger(Events.ERROR, {
-          type: ErrorTypes.OTHER_ERROR,
-          details: ErrorDetails.INTERNAL_EXCEPTION,
-          fatal: false,
-          event: event,
-          error: e,
-        });
+        // Prevent recursion in error event handlers that throw #5497
+        if (!this.triggeringException) {
+          this.triggeringException = true;
+          const fatal = event === Events.ERROR;
+          this.trigger(Events.ERROR, {
+            type: ErrorTypes.OTHER_ERROR,
+            details: ErrorDetails.INTERNAL_EXCEPTION,
+            fatal,
+            event,
+            error,
+          });
+          this.triggeringException = false;
+        }
       }
     }
     return false;
@@ -276,92 +460,233 @@ export default class Hls implements HlsEventEmitter {
    * Dispose of the instance
    */
   destroy() {
-    logger.log('destroy');
+    this.logger.log('destroy');
     this.trigger(Events.DESTROYING, undefined);
     this.detachMedia();
     this.removeAllListeners();
     this._autoLevelCapping = -1;
-    this.url = null;
-    if (this.networkControllers) {
-      this.networkControllers.forEach((component) => component.destroy());
-      // @ts-ignore
-      this.networkControllers = null;
-    }
-    if (this.coreComponents) {
-      this.coreComponents.forEach((component) => component.destroy());
-      // @ts-ignore
-      this.coreComponents = null;
-    }
+    this._url = null;
+
+    this.networkControllers.forEach((component) => component.destroy());
+    this.networkControllers.length = 0;
+
+    this.coreComponents.forEach((component) => component.destroy());
+    this.coreComponents.length = 0;
+
+    this.iframeController = undefined;
+
+    // Remove any references that could be held in config options or callbacks
+    const config = this.config;
+    config.xhrSetup = config.fetchSetup = undefined;
+    // @ts-ignore
+    this.userConfig = null;
   }
 
   /**
    * Attaches Hls.js to a media element
-   * @param {HTMLMediaElement} media
    */
-  attachMedia(media: HTMLMediaElement) {
-    logger.log('attachMedia');
+  attachMedia(data: HTMLMediaElement | MediaAttachingData) {
+    if (!data || ('media' in data && !data.media)) {
+      const error = new Error(`attachMedia failed: invalid argument (${data})`);
+      this.trigger(Events.ERROR, {
+        type: ErrorTypes.OTHER_ERROR,
+        details: ErrorDetails.ATTACH_MEDIA_ERROR,
+        fatal: true,
+        error,
+      });
+      return;
+    }
+    this.logger.log(`attachMedia`);
+    if (this._media) {
+      this.logger.warn(`media must be detached before attaching`);
+      this.detachMedia();
+    }
+    const attachMediaSource = 'media' in data;
+    const media = attachMediaSource ? data.media : data;
+    const attachingData = attachMediaSource ? data : { media };
     this._media = media;
-    this.trigger(Events.MEDIA_ATTACHING, { media: media });
+    this.trigger(Events.MEDIA_ATTACHING, attachingData);
   }
 
   /**
    * Detach Hls.js from the media
    */
   detachMedia() {
-    logger.log('detachMedia');
-    this.trigger(Events.MEDIA_DETACHING, undefined);
+    this.logger.log('detachMedia');
+    const data = {};
+    this.trigger(Events.MEDIA_DETACHING, data);
     this._media = null;
+    this.trigger(Events.MEDIA_DETACHED, data);
+  }
+
+  /**
+   * Detach HTMLMediaElement, MediaSource, and SourceBuffers without reset, for attaching to another instance
+   */
+  transferMedia(): AttachMediaSourceData | null {
+    this._media = null;
+    const transferMedia = this.bufferController?.transferMedia() || null;
+    const data = { transferMedia };
+    this.trigger(Events.MEDIA_DETACHING, data);
+    this.trigger(Events.MEDIA_DETACHED, data);
+    return transferMedia;
   }
 
   /**
    * Set the source URL. Can be relative or absolute.
-   * @param {string} url
    */
   loadSource(url: string) {
     this.stopLoad();
     const media = this.media;
-    if (media && this.url) {
+    const loadedSource = this._url;
+    const loadingSource = (this._url = buildAbsoluteURL(
+      self.location.href,
+      url,
+      {
+        alwaysNormalize: true,
+      },
+    ));
+    this._autoLevelCapping = -1;
+    this._maxHdcpLevel = null;
+    this.logger.log(`loadSource:${loadingSource}`);
+    if (
+      media &&
+      loadedSource &&
+      (loadedSource !== loadingSource ||
+        this.bufferController?.hasSourceTypes())
+    ) {
+      // Remove and re-create MediaSource
       this.detachMedia();
       this.attachMedia(media);
     }
-    url = URLToolkit.buildAbsoluteURL(self.location.href, url, {
-      alwaysNormalize: true,
-    });
-    logger.log(`loadSource:${url}`);
-    this.url = url;
     // when attaching to a source URL, trigger a playlist load
     this.trigger(Events.MANIFEST_LOADING, { url: url });
+  }
+
+  /**
+   * Gets the currently loaded URL
+   */
+  public get url(): string | null {
+    return this._url;
+  }
+
+  /**
+   * Whether or not enough has been buffered to seek to start position or use `media.currentTime` to determine next load position
+   */
+  get hasEnoughToStart(): boolean {
+    return this.streamController.hasEnoughToStart;
+  }
+
+  /**
+   * Get the startPosition set on startLoad(position) or on autostart with config.startPosition
+   */
+  get startPosition(): number {
+    return this.streamController.startPositionValue;
   }
 
   /**
    * Start loading data from the stream source.
    * Depending on default config, client starts loading automatically when a source is set.
    *
-   * @param {number} startPosition Set the start position to stream from
-   * @default -1 None (from earliest point)
+   * @param startPosition - Set the start position to stream from.
+   * Defaults to -1 (None: starts from earliest point)
    */
-  startLoad(startPosition: number = -1) {
-    logger.log(`startLoad(${startPosition})`);
-    this.networkControllers.forEach((controller) => {
-      controller.startLoad(startPosition);
-    });
+  startLoad(startPosition: number = -1, skipSeekToStartPosition?: boolean) {
+    this.logger.log(
+      `startLoad(${
+        startPosition +
+        (skipSeekToStartPosition ? ', <skip seek to start>' : '')
+      })`,
+    );
+    this.started = true;
+    this.resumeBuffering();
+    for (let i = 0; i < this.networkControllers.length; i++) {
+      this.networkControllers[i].startLoad(
+        startPosition,
+        skipSeekToStartPosition,
+      );
+      if (!this.started || !this.networkControllers) {
+        break;
+      }
+    }
   }
 
   /**
    * Stop loading of any stream data.
    */
   stopLoad() {
-    logger.log('stopLoad');
-    this.networkControllers.forEach((controller) => {
-      controller.stopLoad();
-    });
+    this.logger.log('stopLoad');
+    this.started = false;
+    for (let i = 0; i < this.networkControllers.length; i++) {
+      this.networkControllers[i].stopLoad();
+      if (this.started || !this.networkControllers) {
+        break;
+      }
+    }
+  }
+
+  /**
+   * Returns whether loading, toggled with `startLoad()` and `stopLoad()`, is active or not`.
+   */
+  get loadingEnabled(): boolean {
+    return this.started && this.streamController.state !== State.STOPPED;
+  }
+
+  /**
+   * Returns state of fragment loading toggled by calling `pauseBuffering()` and `resumeBuffering()`.
+   */
+  get bufferingEnabled(): boolean {
+    return this.streamController.bufferingEnabled;
+  }
+
+  /**
+   * Resumes stream controller segment loading after `pauseBuffering` has been called.
+   */
+  resumeBuffering() {
+    if (!this.bufferingEnabled) {
+      this.logger.log(`resume buffering`);
+      this.networkControllers.forEach((controller) => {
+        if (controller.resumeBuffering) {
+          controller.resumeBuffering();
+        }
+      });
+    }
+  }
+
+  /**
+   * Prevents stream controller from loading new segments until `resumeBuffering` is called.
+   * This allows for media buffering to be paused without interupting playlist loading.
+   */
+  pauseBuffering() {
+    if (this.bufferingEnabled) {
+      this.logger.log(`pause buffering`);
+      this.networkControllers.forEach((controller) => {
+        if (controller.pauseBuffering) {
+          controller.pauseBuffering();
+        }
+      });
+    }
+  }
+
+  get inFlightFragments(): InFlightFragments {
+    const inFlightData = {
+      [PlaylistLevelType.MAIN]: this.streamController.inFlightFrag,
+    };
+    if (this.audioStreamController) {
+      inFlightData[PlaylistLevelType.AUDIO] =
+        this.audioStreamController.inFlightFrag;
+    }
+    if (this.subtititleStreamController) {
+      inFlightData[PlaylistLevelType.SUBTITLE] =
+        this.subtititleStreamController.inFlightFrag;
+    }
+    return inFlightData;
   }
 
   /**
    * Swap through possible audio codecs in the stream (for example to switch from stereo to 5.1)
    */
   swapAudioCodec() {
-    logger.log('swapAudioCodec');
+    this.logger.log('swapAudioCodec');
     this.streamController.swapAudioCodec();
   }
 
@@ -372,50 +697,78 @@ export default class Hls implements HlsEventEmitter {
    * Automatic recovery of media-errors by this process is configurable.
    */
   recoverMediaError() {
-    logger.log('recoverMediaError');
+    this.logger.log('recoverMediaError');
     const media = this._media;
+    const started = this.started;
+    const time = media?.currentTime;
     this.detachMedia();
     if (media) {
       this.attachMedia(media);
+      if (started) {
+        if (time) {
+          this.startLoad(time);
+        } else if (!this.config.autoStartLoad) {
+          this.startLoad();
+        }
+      }
     }
   }
 
-  removeLevel(levelIndex, urlId = 0) {
-    this.levelController.removeLevel(levelIndex, urlId);
+  removeLevel(levelIndex: number) {
+    this.levelController.removeLevel(levelIndex);
   }
 
   /**
-   * @type {Level[]}
+   * @returns a UUID for this player instance
    */
-  get levels(): Array<Level> {
+  get sessionId(): string {
+    let _sessionId = this._sessionId;
+    if (!_sessionId) {
+      _sessionId = this._sessionId = uuid();
+    }
+    return _sessionId;
+  }
+
+  /**
+   * @returns an array of levels (variants) sorted by HDCP-LEVEL, RESOLUTION (height), FRAME-RATE, CODECS, VIDEO-RANGE, and BANDWIDTH
+   */
+  get levels(): Level[] {
     const levels = this.levelController.levels;
     return levels ? levels : [];
   }
 
   /**
-   * Index of quality level currently played
-   * @type {number}
+   * @returns LevelDetails of last loaded level (variant) or `null` prior to loading a media playlist.
+   */
+  get latestLevelDetails(): LevelDetails | null {
+    return this.streamController.getLevelDetails() || null;
+  }
+
+  /**
+   * @returns Level object of selected level (variant) or `null` prior to selecting a level or once the level is removed.
+   */
+  get loadLevelObj(): Level | null {
+    return this.levelController.loadLevelObj;
+  }
+
+  /**
+   * Index of quality level (variant) currently played
    */
   get currentLevel(): number {
     return this.streamController.currentLevel;
   }
 
   /**
-   * Set quality level index immediately .
-   * This will flush the current buffer to replace the quality asap.
-   * That means playback will interrupt at least shortly to re-buffer and re-sync eventually.
-   * @type {number} -1 for automatic level selection
+   * Set quality level index immediately. This will flush the current buffer to replace the quality asap. That means playback will interrupt at least shortly to re-buffer and re-sync eventually. Set to -1 for automatic level selection.
    */
   set currentLevel(newLevel: number) {
-    logger.log(`set currentLevel:${newLevel}`);
-    this.loadLevel = newLevel;
-    this.abrController.clearTimer();
+    this.logger.log(`set currentLevel:${newLevel}`);
+    this.levelController.manualLevel = newLevel;
     this.streamController.immediateLevelSwitch();
   }
 
   /**
    * Index of next quality level loaded as scheduled by stream controller.
-   * @type {number}
    */
   get nextLevel(): number {
     return this.streamController.nextLevel;
@@ -425,17 +778,16 @@ export default class Hls implements HlsEventEmitter {
    * Set quality level index for next loaded data.
    * This will switch the video quality asap, without interrupting playback.
    * May abort current loading of data, and flush parts of buffer (outside currently played fragment region).
-   * @type {number} -1 for automatic level selection
+   * @param newLevel - Pass -1 for automatic level selection
    */
   set nextLevel(newLevel: number) {
-    logger.log(`set nextLevel:${newLevel}`);
+    this.logger.log(`set nextLevel:${newLevel}`);
     this.levelController.manualLevel = newLevel;
     this.streamController.nextLevelSwitch();
   }
 
   /**
    * Return the quality level of the currently or last (of none is loaded currently) segment
-   * @type {number}
    */
   get loadLevel(): number {
     return this.levelController.level;
@@ -445,16 +797,15 @@ export default class Hls implements HlsEventEmitter {
    * Set quality level index for next loaded data in a conservative way.
    * This will switch the quality without flushing, but interrupt current loading.
    * Thus the moment when the quality switch will appear in effect will only be after the already existing buffer.
-   * @type {number} newLevel -1 for automatic level selection
+   * @param newLevel - Pass -1 for automatic level selection
    */
   set loadLevel(newLevel: number) {
-    logger.log(`set loadLevel:${newLevel}`);
+    this.logger.log(`set loadLevel:${newLevel}`);
     this.levelController.manualLevel = newLevel;
   }
 
   /**
    * get next quality level loaded
-   * @type {number}
    */
   get nextLoadLevel(): number {
     return this.levelController.nextLoadLevel;
@@ -463,7 +814,6 @@ export default class Hls implements HlsEventEmitter {
   /**
    * Set quality level of next loaded segment in a fully "non-destructive" way.
    * Same as `loadLevel` but will wait for next switch (until current loading is done).
-   * @type {number} level
    */
   set nextLoadLevel(level: number) {
     this.levelController.nextLoadLevel = level;
@@ -472,7 +822,6 @@ export default class Hls implements HlsEventEmitter {
   /**
    * Return "first level": like a default level, if not set,
    * falls back to index of first level referenced in manifest
-   * @type {number}
    */
   get firstLevel(): number {
     return Math.max(this.levelController.firstLevel, this.minAutoLevel);
@@ -480,22 +829,24 @@ export default class Hls implements HlsEventEmitter {
 
   /**
    * Sets "first-level", see getter.
-   * @type {number}
    */
   set firstLevel(newLevel: number) {
-    logger.log(`set firstLevel:${newLevel}`);
+    this.logger.log(`set firstLevel:${newLevel}`);
     this.levelController.firstLevel = newLevel;
   }
 
   /**
-   * Return start level (level of first fragment that will be played back)
-   * if not overrided by user, first level appearing in manifest will be used as start level
-   * if -1 : automatic start level selection, playback will start from level matching download bandwidth
-   * (determined from download of first segment)
-   * @type {number}
+   * Return the desired start level for the first fragment that will be loaded.
+   * The default value of -1 indicates automatic start level selection.
+   * Setting hls.nextAutoLevel without setting a startLevel will result in
+   * the nextAutoLevel value being used for one fragment load.
    */
   get startLevel(): number {
-    return this.levelController.startLevel;
+    const startLevel = this.levelController.startLevel;
+    if (startLevel === -1 && this.abrController.forcedAutoLevel > -1) {
+      return this.abrController.forcedAutoLevel;
+    }
+    return startLevel;
   }
 
   /**
@@ -503,10 +854,9 @@ export default class Hls implements HlsEventEmitter {
    * if not overrided by user, first level appearing in manifest will be used as start level
    * if -1 : automatic start level selection, playback will start from level matching download bandwidth
    * (determined from download of first segment)
-   * @type {number} newLevel
    */
   set startLevel(newLevel: number) {
-    logger.log(`set startLevel:${newLevel}`);
+    this.logger.log(`set startLevel:${newLevel}`);
     // if not in automatic start level detection, ensure startLevel is greater than minAutoLevel
     if (newLevel !== -1) {
       newLevel = Math.max(newLevel, this.minAutoLevel);
@@ -516,27 +866,28 @@ export default class Hls implements HlsEventEmitter {
   }
 
   /**
-   * Get the current setting for capLevelToPlayerSize
-   *
-   * @type {boolean}
+   * Whether level capping is enabled.
+   * Default value is set via `config.capLevelToPlayerSize`.
    */
   get capLevelToPlayerSize(): boolean {
     return this.config.capLevelToPlayerSize;
   }
 
   /**
-   * set  dynamically set capLevelToPlayerSize against (`CapLevelController`)
-   *
-   * @type {boolean}
+   * Enables or disables level capping. If disabled after previously enabled, `nextLevelSwitch` will be immediately called.
    */
   set capLevelToPlayerSize(shouldStartCapping: boolean) {
+    const capLevelController = this.capLevelController;
     const newCapLevelToPlayerSize = !!shouldStartCapping;
 
-    if (newCapLevelToPlayerSize !== this.config.capLevelToPlayerSize) {
+    if (
+      capLevelController &&
+      newCapLevelToPlayerSize !== this.config.capLevelToPlayerSize
+    ) {
       if (newCapLevelToPlayerSize) {
-        this.capLevelController.startCapping(); // If capping occurs, nextLevelSwitch will happen based on size.
+        capLevelController.startCapping(); // If capping occurs, nextLevelSwitch will happen based on size.
       } else {
-        this.capLevelController.stopCapping();
+        capLevelController.stopCapping();
         this.autoLevelCapping = -1;
         this.streamController.nextLevelSwitch(); // Now we're uncapped, get the next level asap.
       }
@@ -547,15 +898,13 @@ export default class Hls implements HlsEventEmitter {
 
   /**
    * Capping/max level value that should be used by automatic level selection algorithm (`ABRController`)
-   * @type {number}
    */
   get autoLevelCapping(): number {
     return this._autoLevelCapping;
   }
 
   /**
-   * get bandwidth estimate
-   * @type {number}
+   * Returns the current bandwidth estimate in bits per second, when available. Otherwise, `NaN` is returned.
    */
   get bandwidthEstimate(): number {
     const { bwEstimator } = this.abrController;
@@ -565,20 +914,54 @@ export default class Hls implements HlsEventEmitter {
     return bwEstimator.getEstimate();
   }
 
+  set bandwidthEstimate(abrEwmaDefaultEstimate: number) {
+    this.abrController.resetEstimator(abrEwmaDefaultEstimate);
+  }
+
+  get abrEwmaDefaultEstimate(): number {
+    const { bwEstimator } = this.abrController;
+    if (!bwEstimator) {
+      return NaN;
+    }
+    return bwEstimator.defaultEstimate;
+  }
+
+  /**
+   * get time to first byte estimate
+   * @type {number}
+   */
+  get ttfbEstimate(): number {
+    const { bwEstimator } = this.abrController;
+    if (!bwEstimator) {
+      return NaN;
+    }
+    return bwEstimator.getEstimateTTFB();
+  }
+
   /**
    * Capping/max level value that should be used by automatic level selection algorithm (`ABRController`)
-   * @type {number}
    */
   set autoLevelCapping(newLevel: number) {
     if (this._autoLevelCapping !== newLevel) {
-      logger.log(`set autoLevelCapping:${newLevel}`);
+      this.logger.log(`set autoLevelCapping:${newLevel}`);
       this._autoLevelCapping = newLevel;
+      this.levelController.checkMaxAutoUpdated();
+    }
+  }
+
+  get maxHdcpLevel(): HdcpLevel {
+    return this._maxHdcpLevel;
+  }
+
+  set maxHdcpLevel(value: HdcpLevel) {
+    if (isHdcpLevel(value) && this._maxHdcpLevel !== value) {
+      this._maxHdcpLevel = value;
+      this.levelController.checkMaxAutoUpdated();
     }
   }
 
   /**
    * True when automatic level selection enabled
-   * @type {boolean}
    */
   get autoLevelEnabled(): boolean {
     return this.levelController.manualLevel === -1;
@@ -586,7 +969,6 @@ export default class Hls implements HlsEventEmitter {
 
   /**
    * Level set manually (if any)
-   * @type {number}
    */
   get manualLevel(): number {
     return this.levelController.manualLevel;
@@ -594,7 +976,6 @@ export default class Hls implements HlsEventEmitter {
 
   /**
    * min level selectable in auto mode according to config.minAutoBitrate
-   * @type {number}
    */
   get minAutoLevel(): number {
     const {
@@ -605,7 +986,7 @@ export default class Hls implements HlsEventEmitter {
 
     const len = levels.length;
     for (let i = 0; i < len; i++) {
-      if (levels[i].maxBitrate > minAutoBitrate) {
+      if (levels[i].maxBitrate >= minAutoBitrate) {
         return i;
       }
     }
@@ -615,56 +996,109 @@ export default class Hls implements HlsEventEmitter {
 
   /**
    * max level selectable in auto mode according to autoLevelCapping
-   * @type {number}
    */
   get maxAutoLevel(): number {
-    const { levels, autoLevelCapping } = this;
+    const { levels, autoLevelCapping, maxHdcpLevel } = this;
 
     let maxAutoLevel;
-    if (autoLevelCapping === -1 && levels && levels.length) {
+    if (autoLevelCapping === -1 && levels?.length) {
       maxAutoLevel = levels.length - 1;
     } else {
       maxAutoLevel = autoLevelCapping;
     }
 
+    if (maxHdcpLevel) {
+      for (let i = maxAutoLevel; i--; ) {
+        const hdcpLevel = levels[i].attrs['HDCP-LEVEL'];
+        if (hdcpLevel && hdcpLevel <= maxHdcpLevel) {
+          return i;
+        }
+      }
+    }
+
     return maxAutoLevel;
+  }
+
+  get firstAutoLevel(): number {
+    return this.abrController.firstAutoLevel;
   }
 
   /**
    * next automatically selected quality level
-   * @type {number}
    */
   get nextAutoLevel(): number {
-    // ensure next auto level is between  min and max auto level
-    return Math.min(
-      Math.max(this.abrController.nextAutoLevel, this.minAutoLevel),
-      this.maxAutoLevel
-    );
+    return this.abrController.nextAutoLevel;
   }
 
   /**
    * this setter is used to force next auto level.
    * this is useful to force a switch down in auto mode:
    * in case of load error on level N, hls.js can set nextAutoLevel to N-1 for example)
-   * forced value is valid for one fragment. upon succesful frag loading at forced level,
+   * forced value is valid for one fragment. upon successful frag loading at forced level,
    * this value will be resetted to -1 by ABR controller.
-   * @type {number}
    */
   set nextAutoLevel(nextLevel: number) {
-    this.abrController.nextAutoLevel = Math.max(this.minAutoLevel, nextLevel);
+    this.abrController.nextAutoLevel = nextLevel;
   }
 
   /**
-   * @type {AudioTrack[]}
+   * get the datetime value relative to media.currentTime for the active level Program Date Time if present
    */
-  get audioTracks(): Array<MediaPlaylist> {
+  public get playingDate(): Date | null {
+    return this.streamController.currentProgramDateTime;
+  }
+
+  public get mainForwardBufferInfo(): BufferInfo | null {
+    return this.streamController.getMainFwdBufferInfo();
+  }
+
+  public get audioForwardBufferInfo(): BufferInfo | null {
+    return this.audioStreamController?.getFwdBufferInfo() || null;
+  }
+
+  public get maxBufferLength(): number {
+    return this.streamController.maxBufferLength;
+  }
+
+  /**
+   * Find and select the best matching audio track, making a level switch when a Group change is necessary.
+   * Updates `hls.config.audioPreference`. Returns the selected track, or null when no matching track is found.
+   */
+  public setAudioOption(
+    audioOption: MediaPlaylist | AudioSelectionOption | undefined,
+  ): MediaPlaylist | null {
+    return this.audioTrackController?.setAudioOption(audioOption) || null;
+  }
+  /**
+   * Find and select the best matching subtitle track, making a level switch when a Group change is necessary.
+   * Updates `hls.config.subtitlePreference`. Returns the selected track, or null when no matching track is found.
+   */
+  public setSubtitleOption(
+    subtitleOption: MediaPlaylist | SubtitleSelectionOption | undefined,
+  ): MediaPlaylist | null {
+    return (
+      this.subtitleTrackController?.setSubtitleOption(subtitleOption) || null
+    );
+  }
+
+  /**
+   * Get the complete list of audio tracks across all media groups
+   */
+  get allAudioTracks(): MediaPlaylist[] {
+    const audioTrackController = this.audioTrackController;
+    return audioTrackController ? audioTrackController.allAudioTracks : [];
+  }
+
+  /**
+   * Get the list of selectable audio tracks
+   */
+  get audioTracks(): MediaPlaylist[] {
     const audioTrackController = this.audioTrackController;
     return audioTrackController ? audioTrackController.audioTracks : [];
   }
 
   /**
    * index of the selected audio track (index in audio track lists)
-   * @type {number}
    */
   get audioTrack(): number {
     const audioTrackController = this.audioTrackController;
@@ -673,7 +1107,6 @@ export default class Hls implements HlsEventEmitter {
 
   /**
    * selects an audio track, based on its index in audio track lists
-   * @type {number}
    */
   set audioTrack(audioTrackId: number) {
     const audioTrackController = this.audioTrackController;
@@ -683,10 +1116,41 @@ export default class Hls implements HlsEventEmitter {
   }
 
   /**
-   * get alternate subtitle tracks list from playlist
-   * @type {MediaPlaylist[]}
+   * Index of next audio track as scheduled by audio stream controller.
    */
-  get subtitleTracks(): Array<MediaPlaylist> {
+  get nextAudioTrack(): number {
+    return this.audioStreamController?.nextAudioTrack ?? -1;
+  }
+
+  /**
+   * Set audio track index for next loaded data.
+   * This will switch the audio track asap, without interrupting playback.
+   * May abort current loading of data, and flush parts of buffer(outside
+   * currently played fragment region). Audio Track Switched event will be
+   * delayed until the currently playing fragment is of the next audio track.
+   * @param audioTrackId - Pass -1 for automatic level selection
+   */
+  set nextAudioTrack(audioTrackId: number) {
+    const { audioTrackController } = this;
+    if (audioTrackController) {
+      audioTrackController.nextAudioTrack = audioTrackId;
+    }
+  }
+
+  /**
+   * get the complete list of subtitle tracks across all media groups
+   */
+  get allSubtitleTracks(): MediaPlaylist[] {
+    const subtitleTrackController = this.subtitleTrackController;
+    return subtitleTrackController
+      ? subtitleTrackController.allSubtitleTracks
+      : [];
+  }
+
+  /**
+   * get alternate subtitle tracks list from playlist
+   */
+  get subtitleTracks(): MediaPlaylist[] {
     const subtitleTrackController = this.subtitleTrackController;
     return subtitleTrackController
       ? subtitleTrackController.subtitleTracks
@@ -695,7 +1159,6 @@ export default class Hls implements HlsEventEmitter {
 
   /**
    * index of the selected subtitle track (index in subtitle track lists)
-   * @type {number}
    */
   get subtitleTrack(): number {
     const subtitleTrackController = this.subtitleTrackController;
@@ -708,7 +1171,6 @@ export default class Hls implements HlsEventEmitter {
 
   /**
    * select an subtitle track, based on its index in subtitle track lists
-   * @type {number}
    */
   set subtitleTrack(subtitleTrackId: number) {
     const subtitleTrackController = this.subtitleTrackController;
@@ -718,7 +1180,7 @@ export default class Hls implements HlsEventEmitter {
   }
 
   /**
-   * @type {boolean}
+   * Whether subtitle display is enabled or not
    */
   get subtitleDisplay(): boolean {
     const subtitleTrackController = this.subtitleTrackController;
@@ -729,7 +1191,6 @@ export default class Hls implements HlsEventEmitter {
 
   /**
    * Enable/disable subtitle display rendering
-   * @type {boolean}
    */
   set subtitleDisplay(value: boolean) {
     const subtitleTrackController = this.subtitleTrackController;
@@ -740,144 +1201,352 @@ export default class Hls implements HlsEventEmitter {
 
   /**
    * get mode for Low-Latency HLS loading
-   * @type {boolean}
    */
-  get lowLatencyMode() {
+  get lowLatencyMode(): boolean {
     return this.config.lowLatencyMode;
   }
 
   /**
    * Enable/disable Low-Latency HLS part playlist and segment loading, and start live streams at playlist PART-HOLD-BACK rather than HOLD-BACK.
-   * @type {boolean}
    */
   set lowLatencyMode(mode: boolean) {
     this.config.lowLatencyMode = mode;
   }
 
   /**
-   * position (in seconds) of live sync point (ie edge of live position minus safety delay defined by ```hls.config.liveSyncDuration```)
-   * @type {number}
+   * Position (in seconds) of live sync point (ie edge of live position minus safety delay defined by ```hls.config.liveSyncDuration```)
+   * @returns null prior to loading live Playlist
    */
   get liveSyncPosition(): number | null {
-    return this.latencyController.liveSyncPosition;
+    return this.latencyController?.liveSyncPosition ?? null;
   }
 
   /**
-   * estimated position (in seconds) of live edge (ie edge of live playlist plus time sync playlist advanced)
-   * returns 0 before first playlist is loaded
-   * @type {number}
+   * Estimated position (in seconds) of live edge (ie edge of live playlist plus time sync playlist advanced)
+   * @returns 0 before first playlist is loaded
    */
-  get latency() {
-    return this.latencyController.latency;
+  get latency(): number {
+    return this.latencyController?.latency || 0;
   }
 
   /**
    * maximum distance from the edge before the player seeks forward to ```hls.liveSyncPosition```
    * configured using ```liveMaxLatencyDurationCount``` (multiple of target duration) or ```liveMaxLatencyDuration```
-   * returns 0 before first playlist is loaded
-   * @type {number}
+   * @returns 0 before first playlist is loaded
    */
   get maxLatency(): number {
-    return this.latencyController.maxLatency;
+    return this.latencyController?.maxLatency || 0;
   }
 
   /**
    * target distance from the edge as calculated by the latency controller
-   * @type {number}
    */
   get targetLatency(): number | null {
-    return this.latencyController.targetLatency;
+    return this.latencyController?.targetLatency || null;
+  }
+
+  set targetLatency(latency: number) {
+    if (!this.latencyController) return;
+    this.latencyController.targetLatency = latency;
+  }
+
+  /**
+   * the rate at which the edge of the current live playlist is advancing or 1 if there is none
+   */
+  get drift(): number | null {
+    return this.latencyController?.drift || null;
   }
 
   /**
    * set to true when startLoad is called before MANIFEST_PARSED event
-   * @type {boolean}
    */
   get forceStartLoad(): boolean {
     return this.streamController.forceStartLoad;
   }
+
+  /**
+   * ContentSteering pathways getter
+   */
+  get pathways(): string[] {
+    return this.levelController.pathways;
+  }
+
+  /**
+   * ContentSteering pathwayPriority getter/setter
+   */
+  get pathwayPriority(): string[] | null {
+    return this.levelController.pathwayPriority;
+  }
+
+  set pathwayPriority(pathwayPriority: string[]) {
+    this.levelController.pathwayPriority = pathwayPriority;
+  }
+
+  /**
+   * returns true when all SourceBuffers are buffered to the end
+   */
+  get bufferedToEnd(): boolean {
+    return !!this.bufferController?.bufferedToEnd;
+  }
+
+  /**
+   * returns Interstitials Program Manager
+   */
+  get interstitialsManager(): InterstitialsManager | null {
+    if (__USE_INTERSTITIALS__ && this.interstitialsController) {
+      return this.interstitialsController.interstitialsManager;
+    }
+    return null;
+  }
+
+  /**
+   * returns an array of parsed iframe variants
+   */
+  get iframeVariants(): LevelParsed[] {
+    const iframeVariants = this.levelController.iframeVariants;
+    return iframeVariants ? iframeVariants : [];
+  }
+
+  /**
+   * Returns an new iframe focused Hls (HlsIFramesOnly) instance based on `iframeVariants` found in the current asset,
+   * or null when none are available. An iframe instance uses iframe variants as its `levels`.
+   * Use HlsIFramesOnly.loadMediaAt(time) to render video IFrames in an attached video element.
+   */
+  createIFramePlayer(
+    configOverride?: Partial<HlsConfig>,
+  ): HlsIFramesOnly | null {
+    if (__USE_IFRAMES__ && this._url && this.iframeController) {
+      return this.iframeController.createIFramePlayer(configOverride);
+    }
+    return null;
+  }
+
+  /**
+   * Returns an new image iframe focused Hls (HlsImageIFramesOnly) instance based on `iframeVariants` found in the
+   * current asset, or null when no image variants are available. An image iframe instance uses iframe variants with
+   * image codec values in CODECS ("mjpg") as its `levels`.
+   * Use HlsIFramesOnly.loadMediaAt(time) to load image IFrames.
+   * Attach an HTMLImageElement with HlsImageIFramesOnly.attachImage(image), or process image data on FRAG_LOADED.
+   */
+  createImageIFramePlayer(
+    configOverride?: Partial<HlsConfig>,
+  ): HlsImageIFramesOnly | null {
+    if (__USE_IFRAMES__ && this._url && this.iframeController) {
+      return this.iframeController.createImageIFramePlayer(configOverride);
+    }
+    return null;
+  }
+
+  /**
+   * returns mediaCapabilities.decodingInfo for a variant/rendition
+   */
+  getMediaDecodingInfo(
+    level: Level,
+    audioTracks: MediaPlaylist[] = this.allAudioTracks,
+  ): Promise<MediaDecodingInfo> {
+    const audioTracksByGroup = getAudioTracksByGroup(audioTracks);
+    return getMediaDecodingInfoPromise(
+      level,
+      audioTracksByGroup,
+      navigator.mediaCapabilities,
+    );
+  }
 }
 
+export type InFlightFragments = {
+  [PlaylistLevelType.MAIN]: InFlightData;
+  [PlaylistLevelType.AUDIO]?: InFlightData;
+  [PlaylistLevelType.SUBTITLE]?: InFlightData;
+};
 export type {
+  AudioSelectionOption,
+  SubtitleSelectionOption,
+  VideoSelectionOption,
   MediaPlaylist,
   ErrorDetails,
   ErrorTypes,
   Events,
   Level,
+  LevelDetails,
   HlsListeners,
   HlsEventEmitter,
   HlsConfig,
-  Fragment,
+  BufferInfo,
+  BufferTimeRange,
+  HdcpLevel,
+  AbrController,
+  AudioStreamController,
+  AudioTrackController,
+  BasePlaylistController,
+  BaseStreamController,
+  BufferController,
+  CapLevelController,
+  CMCDController,
+  ContentSteeringController,
+  EMEController,
+  ErrorController,
+  FPSController,
+  GapController,
+  IFrameController,
+  HlsIFramesOnly,
+  HlsImageIFramesOnly,
+  InterstitialsController,
+  LatencyController,
+  StreamController,
+  SubtitleStreamController,
+  SubtitleTrackController,
+  EwmaBandWidthEstimator,
+  InterstitialsManager,
+  Decrypter,
+  FragmentLoader,
+  KeyLoader,
+  TaskLoop,
+  TransmuxerInterface,
+  InFlightData,
+  State,
+  BaseLoader,
+  XhrLoader,
+  FetchLoader,
+  Cues,
+  M3U8Parser,
 };
-
 export type {
   ABRControllerConfig,
+  PlaylistControllerConfig,
   BufferControllerConfig,
   CapLevelControllerConfig,
+  CMCDControllerConfig,
+  CmcdCustomReporter,
+  CmcdCustomData,
   EMEControllerConfig,
+  DRMSystemConfiguration,
+  DRMSystemsConfiguration,
   DRMSystemOptions,
+  ErrorControllerConfig,
   FPSControllerConfig,
   FragmentLoaderConfig,
+  FragmentLoaderConstructor,
+  GapControllerConfig,
+  HlsLoadPolicies,
+  IFrameControllerConfig,
   LevelControllerConfig,
+  LoaderConfig,
+  LoadPolicy,
   MP4RemuxerConfig,
   PlaylistLoaderConfig,
+  PlaylistLoaderConstructor,
+  RetryConfig,
+  SelectionPreferences,
   StreamControllerConfig,
   LatencyControllerConfig,
+  MetadataControllerConfig,
   TimelineControllerConfig,
   TSDemuxerConfig,
 } from './config';
-export type { CuesInterface } from './utils/cues';
-export type { MediaKeyFunc, KeySystems } from './utils/mediakeys-helper';
+export type {
+  GenerateRequestFilterResult,
+  KeyRequests,
+  KeyStatuses,
+  KeyTimeouts,
+  LicenseAndKeysRequest,
+  LicenseRequestReason,
+  MediaKeySessionContext,
+} from './controller/eme-controller';
+export type {
+  FragmentState,
+  FragmentTracker,
+} from './controller/fragment-tracker';
+export type { FragmentEntity } from './types/fragment-tracker';
+export type {
+  PathwayClone,
+  SteeringManifest,
+  UriReplacement,
+} from './controller/content-steering-controller';
+export type {
+  NetworkErrorAction,
+  ErrorActionFlags,
+  IErrorAction,
+} from './controller/error-controller';
+export type { ID3TrackController } from './controller/id3-track-controller';
+export type { LoadMediaAtOptions } from './controller/iframe-stream-controller';
+export type {
+  HlsAssetPlayer,
+  HlsAssetPlayerConfig,
+  InterstitialPlayer,
+} from './controller/interstitial-player';
+export type { PlayheadTimes } from './controller/interstitials-controller';
+export type {
+  InterstitialScheduleDurations,
+  InterstitialScheduleEventItem,
+  InterstitialScheduleItem,
+  InterstitialSchedulePrimaryItem,
+} from './controller/interstitials-schedule';
+export type { TimelineController } from './controller/timeline-controller';
+export type { DecrypterAesMode } from './crypt/decrypter-aes-mode';
+export type { DateRange, DateRangeCue } from './loader/date-range';
 export type { LoadStats } from './loader/load-stats';
 export type { LevelKey } from './loader/level-key';
-export type { LevelDetails } from './loader/level-details';
-export type { SourceBufferName } from './types/buffer';
-export type { MetadataSample, UserdataSample } from './types/demuxer';
 export type {
-  LevelParsed,
-  LevelAttributes,
-  HlsUrlParameters,
-  HlsSkip,
-} from './types/level';
-export type {
-  PlaylistLevelType,
-  HlsChunkPerformanceTiming,
-  HlsPerformanceTiming,
-  PlaylistContextType,
-  PlaylistLoaderContext,
-  FragmentLoaderContext,
-  Loader,
-  LoaderStats,
-  LoaderContext,
-  LoaderResponse,
-  LoaderConfiguration,
-  LoaderCallbacks,
-  LoaderOnProgress,
-  LoaderOnAbort,
-  LoaderOnError,
-  LoaderOnSuccess,
-  LoaderOnTimeout,
-  HlsProgressivePerformanceTiming,
-} from './types/loader';
-export type {
-  MediaPlaylistType,
-  MainPlaylistType,
-  AudioPlaylistType,
-  SubtitlePlaylistType,
-} from './types/media-playlist';
-export type { Track, TrackSet } from './types/track';
-export type { ChunkMetadata } from './types/transmuxer';
-export type {
+  Base,
   BaseSegment,
+  EncryptedFragment,
+  Fragment,
+  MediaFragment,
   Part,
+  MediaFragmentRef,
   ElementaryStreams,
   ElementaryStreamTypes,
   ElementaryStreamInfo,
 } from './loader/fragment';
 export type {
+  FragLoadFailResult,
+  FragmentLoadProgressCallback,
+  LoadError,
+} from './loader/fragment-loader';
+export type { KeyLoaderInfo } from './loader/key-loader';
+export type { DecryptData } from './loader/level-key';
+export type {
+  AssetListJSON,
+  BaseData,
+  InterstitialAssetId,
+  InterstitialAssetItem,
+  InterstitialEvent,
+  InterstitialEventWithAssetList,
+  InterstitialId,
+  PlaybackRestrictions,
+  SnapOptions,
+  TimelineOccupancy,
+} from './loader/interstitial-event';
+export type {
+  ParsedMultivariantPlaylist,
+  ParsedMultivariantMediaOptions,
+} from './loader/m3u8-parser';
+export type {
+  AttachMediaSourceData,
+  BaseTrack,
+  BaseTrackSet,
+  BufferCreatedTrack,
+  BufferCreatedTrackSet,
+  ExtendedSourceBuffer,
+  MediaOverrides,
+  ParsedTrack,
+  SourceBufferName,
+  SourceBufferListener,
+  SourceBufferTrack,
+  SourceBufferTrackSet,
+} from './types/buffer';
+export type {
+  ComponentAPI,
+  AbrComponentAPI,
+  NetworkComponentAPI,
+} from './types/component-api';
+export type {
   TrackLoadingData,
   TrackLoadedData,
+  AssetListLoadedData,
+  AssetListLoadingData,
   AudioTrackLoadedData,
+  AudioTrackUpdatedData,
   AudioTracksUpdatedData,
   AudioTrackSwitchedData,
   AudioTrackSwitchingData,
@@ -914,16 +1583,105 @@ export type {
   LevelSwitchingData,
   LevelUpdatedData,
   LiveBackBufferData,
+  ContentSteeringOptions,
   ManifestLoadedData,
   ManifestLoadingData,
   ManifestParsedData,
+  MaxAutoLevelUpdatedData,
   MediaAttachedData,
   MediaAttachingData,
+  MediaDetachedData,
+  MediaDetachingData,
+  MediaEndedData,
   NonNativeTextTrack,
   NonNativeTextTracksData,
+  PartsLoadedData,
+  SteeringManifestLoadedData,
   SubtitleFragProcessedData,
   SubtitleTrackLoadedData,
+  SubtitleTrackUpdatedData,
   SubtitleTracksUpdatedData,
   SubtitleTrackSwitchData,
+  InterstitialsUpdatedData,
+  InterstitialsBufferedToBoundaryData,
+  InterstitialAssetPlayerCreatedData,
+  InterstitialStartedData,
+  InterstitialEndedData,
+  InterstitialAssetStartedData,
+  InterstitialAssetEndedData,
+  InterstitialAssetErrorData,
+  InterstitialsPrimaryResumed,
 } from './types/events';
+export type {
+  MetadataSample,
+  MetadataSchema,
+  UserdataSample,
+} from './types/demuxer';
+export type {
+  InitSegmentData,
+  RemuxedMetadata,
+  RemuxedTrack,
+  RemuxedUserdata,
+  RemuxerResult,
+} from './types/remuxer';
+export type {
+  NetworkDetails,
+  NullableNetworkDetails,
+} from './types/network-details';
 export type { AttrList } from './utils/attr-list';
+export type { Bufferable } from './utils/buffer-helper';
+export type { CaptionScreen } from './utils/cea-608-parser';
+export type { CuesInterface } from './utils/cues';
+export type {
+  CodecsParsed,
+  HdcpLevels,
+  HlsSkip,
+  HlsUrlParameters,
+  LevelAttributes,
+  LevelParsed,
+  VariableMap,
+  VideoRange,
+  VideoRangeValues,
+} from './types/level';
+export type {
+  PlaylistLevelType,
+  LoaderContextType,
+  HlsChunkPerformanceTiming,
+  HlsPerformanceTiming,
+  HlsProgressivePerformanceTiming,
+  PlaylistContextType,
+  PlaylistLoaderContext,
+  FragmentLoaderContext,
+  KeyLoaderContext,
+  Loader,
+  LoaderStats,
+  LoaderContext,
+  LoaderResponse,
+  LoaderConfiguration,
+  LoaderCallbacks,
+  LoaderOnProgress,
+  LoaderOnAbort,
+  LoaderOnError,
+  LoaderOnSuccess,
+  LoaderOnTimeout,
+} from './types/loader';
+export type { ILogFunction, ILogger, Logger } from './utils/logger';
+export type {
+  MediaAttributes,
+  MediaPlaylistType,
+  MainPlaylistType,
+  AudioPlaylistType,
+  SubtitlePlaylistType,
+} from './types/media-playlist';
+export type { Track, TrackSet } from './types/track';
+export type { ChunkMetadata, TransmuxerResult } from './types/transmuxer';
+export type { MediaDecodingInfo } from './utils/mediacapabilities-helper';
+export type {
+  MediaKeyFunc,
+  KeySystems,
+  KeySystemFormats,
+} from './utils/mediakeys-helper';
+export type {
+  RationalTimestamp,
+  TimestampOffset,
+} from './utils/timescale-conversion';

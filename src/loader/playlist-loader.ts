@@ -4,46 +4,52 @@
  * Once loaded, dispatches events with parsed data-models of manifest/levels/audio/subtitle tracks.
  *
  * Uses loader(s) set in config to do actual internal loading of resource tasks.
- *
- * @module
- *
  */
 
-import { Events } from '../events';
-import { ErrorDetails, ErrorTypes } from '../errors';
-import { logger } from '../utils/logger';
-import { parseSegmentIndex } from '../utils/mp4-tools';
 import M3U8Parser from './m3u8-parser';
-import type { LevelParsed } from '../types/level';
+import { ErrorDetails, ErrorTypes } from '../errors';
+import { Events } from '../events';
+import { LoaderContextType, PlaylistLevelType } from '../types/loader';
+import { AttrList } from '../utils/attr-list';
+import {
+  areCodecsMediaSourceSupported,
+  sampleEntryCodesISO,
+} from '../utils/codecs';
+import { computeReloadInterval } from '../utils/level-helper';
+import type { LevelDetails } from './level-details';
+import type { LoaderConfig, RetryConfig } from '../config';
+import type Hls from '../hls';
+import type { NetworkComponentAPI } from '../types/component-api';
+import type {
+  ErrorData,
+  LevelLoadingData,
+  LevelsUpdatedData,
+  ManifestLoadingData,
+  TrackLoadingData,
+} from '../types/events';
+import type { Level, LevelParsed, VariableMap } from '../types/level';
 import type {
   Loader,
+  LoaderCallbacks,
   LoaderConfiguration,
   LoaderContext,
   LoaderResponse,
   LoaderStats,
+  PlaylistContextType,
   PlaylistLoaderContext,
 } from '../types/loader';
-import { PlaylistContextType, PlaylistLevelType } from '../types/loader';
-import { LevelDetails } from './level-details';
-import { Fragment } from './fragment';
-import type Hls from '../hls';
-import { AttrList } from '../utils/attr-list';
-import type {
-  ErrorData,
-  LevelLoadingData,
-  ManifestLoadingData,
-  TrackLoadingData,
-} from '../types/events';
+import type { MediaAttributes, MediaPlaylist } from '../types/media-playlist';
+import type { NullableNetworkDetails } from '../types/network-details';
 
 function mapContextToLevelType(
-  context: PlaylistLoaderContext
+  context: PlaylistLoaderContext,
 ): PlaylistLevelType {
   const { type } = context;
 
   switch (type) {
-    case PlaylistContextType.AUDIO_TRACK:
+    case LoaderContextType.AUDIO_TRACK:
       return PlaylistLevelType.AUDIO;
-    case PlaylistContextType.SUBTITLE_TRACK:
+    case LoaderContextType.SUBTITLE_TRACK:
       return PlaylistLevelType.SUBTITLE;
     default:
       return PlaylistLevelType.MAIN;
@@ -52,7 +58,7 @@ function mapContextToLevelType(
 
 function getResponseUrl(
   response: LoaderResponse,
-  context: PlaylistLoaderContext
+  context: PlaylistLoaderContext,
 ): string {
   let url = response.url;
   // responseURL not supported on some browsers (it is used to detect URL redirection)
@@ -64,17 +70,23 @@ function getResponseUrl(
   return url;
 }
 
-class PlaylistLoader {
+class PlaylistLoader implements NetworkComponentAPI {
   private readonly hls: Hls;
   private readonly loaders: {
     [key: string]: Loader<LoaderContext>;
   } = Object.create(null);
-
-  private checkAgeHeader: boolean = true;
+  private variableList: VariableMap | null = null;
+  public onManifestLoaded = this.checkAutostartLoad;
 
   constructor(hls: Hls) {
     this.hls = hls;
     this.registerListeners();
+  }
+
+  public startLoad(startPosition: number): void {}
+
+  public stopLoad(): void {
+    this.destroyInternalLoaders();
   }
 
   private registerListeners() {
@@ -83,6 +95,7 @@ class PlaylistLoader {
     hls.on(Events.LEVEL_LOADING, this.onLevelLoading, this);
     hls.on(Events.AUDIO_TRACK_LOADING, this.onAudioTrackLoading, this);
     hls.on(Events.SUBTITLE_TRACK_LOADING, this.onSubtitleTrackLoading, this);
+    hls.on(Events.LEVELS_UPDATED, this.onLevelsUpdated, this);
   }
 
   private unregisterListeners() {
@@ -91,34 +104,32 @@ class PlaylistLoader {
     hls.off(Events.LEVEL_LOADING, this.onLevelLoading, this);
     hls.off(Events.AUDIO_TRACK_LOADING, this.onAudioTrackLoading, this);
     hls.off(Events.SUBTITLE_TRACK_LOADING, this.onSubtitleTrackLoading, this);
+    hls.off(Events.LEVELS_UPDATED, this.onLevelsUpdated, this);
   }
 
   /**
    * Returns defaults or configured loader-type overloads (pLoader and loader config params)
    */
   private createInternalLoader(
-    context: PlaylistLoaderContext
+    context: PlaylistLoaderContext,
   ): Loader<LoaderContext> {
     const config = this.hls.config;
     const PLoader = config.pLoader;
     const Loader = config.loader;
     const InternalLoader = PLoader || Loader;
-
     const loader = new InternalLoader(config) as Loader<PlaylistLoaderContext>;
 
-    context.loader = loader;
     this.loaders[context.type] = loader;
-
     return loader;
   }
 
   private getInternalLoader(
-    context: PlaylistLoaderContext
-  ): Loader<LoaderContext> {
+    context: PlaylistLoaderContext,
+  ): Loader<LoaderContext> | undefined {
     return this.loaders[context.type];
   }
 
-  private resetInternalLoader(contextType): void {
+  private resetInternalLoader(contextType: PlaylistContextType): void {
     if (this.loaders[contextType]) {
       delete this.loaders[contextType];
     }
@@ -134,75 +145,99 @@ class PlaylistLoader {
         loader.destroy();
       }
 
-      this.resetInternalLoader(contextType);
+      this.resetInternalLoader(contextType as PlaylistContextType);
     }
   }
 
   public destroy(): void {
+    this.variableList = null;
     this.unregisterListeners();
     this.destroyInternalLoaders();
   }
 
   private onManifestLoading(
     event: Events.MANIFEST_LOADING,
-    data: ManifestLoadingData
+    data: ManifestLoadingData,
   ) {
     const { url } = data;
-    this.checkAgeHeader = true;
+    this.variableList = null;
     this.load({
       id: null,
-      groupId: null,
       level: 0,
       responseType: 'text',
-      type: PlaylistContextType.MANIFEST,
+      type: LoaderContextType.MANIFEST,
       url,
       deliveryDirectives: null,
+      levelOrTrack: null,
     });
   }
 
   private onLevelLoading(event: Events.LEVEL_LOADING, data: LevelLoadingData) {
-    const { id, level, url, deliveryDirectives } = data;
+    const { id, level, pathwayId, url, deliveryDirectives, levelInfo } = data;
     this.load({
       id,
-      groupId: null,
       level,
+      pathwayId,
       responseType: 'text',
-      type: PlaylistContextType.LEVEL,
+      type: LoaderContextType.LEVEL,
       url,
       deliveryDirectives,
+      levelOrTrack: levelInfo,
     });
   }
 
   private onAudioTrackLoading(
     event: Events.AUDIO_TRACK_LOADING,
-    data: TrackLoadingData
+    data: TrackLoadingData,
   ) {
-    const { id, groupId, url, deliveryDirectives } = data;
+    const { id, groupId, url, deliveryDirectives, track } = data;
     this.load({
       id,
       groupId,
       level: null,
       responseType: 'text',
-      type: PlaylistContextType.AUDIO_TRACK,
+      type: LoaderContextType.AUDIO_TRACK,
       url,
       deliveryDirectives,
+      levelOrTrack: track,
     });
   }
 
   private onSubtitleTrackLoading(
     event: Events.SUBTITLE_TRACK_LOADING,
-    data: TrackLoadingData
+    data: TrackLoadingData,
   ) {
-    const { id, groupId, url, deliveryDirectives } = data;
+    const { id, groupId, url, deliveryDirectives, track } = data;
     this.load({
       id,
       groupId,
       level: null,
       responseType: 'text',
-      type: PlaylistContextType.SUBTITLE_TRACK,
+      type: LoaderContextType.SUBTITLE_TRACK,
       url,
       deliveryDirectives,
+      levelOrTrack: track,
     });
+  }
+
+  private onLevelsUpdated(
+    event: Events.LEVELS_UPDATED,
+    data: LevelsUpdatedData,
+  ) {
+    // abort and delete loader of removed levels
+    const loader = this.loaders[LoaderContextType.LEVEL];
+    if (loader) {
+      const context = loader.context;
+      if (
+        context &&
+        !data.levels.some(
+          (lvl) => lvl === (context as PlaylistLoaderContext).levelOrTrack,
+        )
+      ) {
+        loader.abort();
+        delete this.loaders[LoaderContextType.LEVEL];
+      }
+    }
   }
 
   private load(context: PlaylistLoaderContext): void {
@@ -213,65 +248,57 @@ class PlaylistLoader {
     // Check if a loader for this context already exists
     let loader = this.getInternalLoader(context);
     if (loader) {
-      const loaderContext = loader.context;
-      if (loaderContext && loaderContext.url === context.url) {
-        // same URL can't overlap
-        logger.trace('[playlist-loader]: playlist request ongoing');
+      const logger = this.hls.logger;
+      const loaderContext = loader.context as PlaylistLoaderContext;
+      if (
+        loaderContext?.levelOrTrack === context.levelOrTrack &&
+        (loaderContext.url === context.url ||
+          (loaderContext.deliveryDirectives && !context.deliveryDirectives))
+      ) {
+        // same URL can't overlap, or wait for blocking request
+        if (loaderContext.url === context.url) {
+          logger.log(
+            `[playlist-loader]: ignore ${context.url} ongoing request`,
+          );
+        } else {
+          logger.log(
+            `[playlist-loader]: ignore ${context.url} in favor of ${loaderContext.url}`,
+          );
+        }
         return;
       }
       logger.log(
-        `[playlist-loader]: aborting previous loader for type: ${context.type}`
+        `[playlist-loader]: aborting previous loader for type: ${context.type}`,
       );
       loader.abort();
     }
 
-    let maxRetry;
-    let timeout;
-    let retryDelay;
-    let maxRetryDelay;
-
     // apply different configs for retries depending on
     // context (manifest, level, audio/subs playlist)
-    switch (context.type) {
-      case PlaylistContextType.MANIFEST:
-        maxRetry = config.manifestLoadingMaxRetry;
-        timeout = config.manifestLoadingTimeOut;
-        retryDelay = config.manifestLoadingRetryDelay;
-        maxRetryDelay = config.manifestLoadingMaxRetryTimeout;
-        break;
-      case PlaylistContextType.LEVEL:
-      case PlaylistContextType.AUDIO_TRACK:
-      case PlaylistContextType.SUBTITLE_TRACK:
-        // Manage retries in Level/Track Controller
-        maxRetry = 0;
-        timeout = config.levelLoadingTimeOut;
-        break;
-      default:
-        maxRetry = config.levelLoadingMaxRetry;
-        timeout = config.levelLoadingTimeOut;
-        retryDelay = config.levelLoadingRetryDelay;
-        maxRetryDelay = config.levelLoadingMaxRetryTimeout;
-        break;
+    let loadPolicy: LoaderConfig;
+    if (context.type === LoaderContextType.MANIFEST) {
+      loadPolicy = config.manifestLoadPolicy.default;
+    } else {
+      loadPolicy = Object.assign({}, config.playlistLoadPolicy.default, {
+        timeoutRetry: null,
+        errorRetry: null,
+      });
     }
-
     loader = this.createInternalLoader(context);
 
     // Override level/track timeout for LL-HLS requests
     // (the default of 10000ms is counter productive to blocking playlist reload requests)
-    if (context.deliveryDirectives?.part) {
+    if (Number.isFinite(context.deliveryDirectives?.part)) {
       let levelDetails: LevelDetails | undefined;
-      if (
-        context.type === PlaylistContextType.LEVEL &&
-        context.level !== null
-      ) {
+      if (context.type === LoaderContextType.LEVEL && context.level !== null) {
         levelDetails = this.hls.levels[context.level].details;
       } else if (
-        context.type === PlaylistContextType.AUDIO_TRACK &&
+        context.type === LoaderContextType.AUDIO_TRACK &&
         context.id !== null
       ) {
         levelDetails = this.hls.audioTracks[context.id].details;
       } else if (
-        context.type === PlaylistContextType.SUBTITLE_TRACK &&
+        context.type === LoaderContextType.SUBTITLE_TRACK &&
         context.id !== null
       ) {
         levelDetails = this.hls.subtitleTracks[context.id].details;
@@ -280,26 +307,75 @@ class PlaylistLoader {
         const partTarget = levelDetails.partTarget;
         const targetDuration = levelDetails.targetduration;
         if (partTarget && targetDuration) {
-          timeout = Math.min(
-            Math.max(partTarget * 3, targetDuration * 0.8) * 1000,
-            timeout
-          );
+          const maxLowLatencyPlaylistRefresh =
+            Math.max(partTarget * 3, targetDuration * 0.8) * 1000;
+          loadPolicy = Object.assign({}, loadPolicy, {
+            maxTimeToFirstByteMs: Math.min(
+              maxLowLatencyPlaylistRefresh,
+              loadPolicy.maxTimeToFirstByteMs,
+            ),
+            maxLoadTimeMs: Math.min(
+              maxLowLatencyPlaylistRefresh,
+              loadPolicy.maxTimeToFirstByteMs,
+            ),
+          });
         }
       }
     }
 
+    const legacyRetryCompatibility: RetryConfig | Record<string, void> =
+      loadPolicy.errorRetry || loadPolicy.timeoutRetry || {};
     const loaderConfig: LoaderConfiguration = {
-      timeout,
-      maxRetry,
-      retryDelay,
-      maxRetryDelay,
-      highWaterMark: 0,
+      loadPolicy,
+      timeout: loadPolicy.maxLoadTimeMs,
+      maxRetry: legacyRetryCompatibility.maxNumRetry || 0,
+      retryDelay: legacyRetryCompatibility.retryDelayMs || 0,
+      maxRetryDelay: legacyRetryCompatibility.maxRetryDelayMs || 0,
     };
 
-    const loaderCallbacks = {
-      onSuccess: this.loadsuccess.bind(this),
-      onError: this.loaderror.bind(this),
-      onTimeout: this.loadtimeout.bind(this),
+    const loaderCallbacks: LoaderCallbacks<PlaylistLoaderContext> = {
+      onSuccess: (response, stats, context, networkDetails) => {
+        const loader = this.getInternalLoader(context) as
+          | Loader<PlaylistLoaderContext>
+          | undefined;
+        this.resetInternalLoader(context.type);
+
+        const string = response.data as string;
+
+        stats.parsing.start = performance.now();
+        if (
+          M3U8Parser.isMediaPlaylist(string) ||
+          context.type !== LoaderContextType.MANIFEST
+        ) {
+          this.handleTrackOrLevelPlaylist(
+            response,
+            stats,
+            context,
+            networkDetails || null,
+            loader,
+          );
+        } else {
+          this.handleMasterPlaylist(response, stats, context, networkDetails);
+        }
+      },
+      onError: (response, context, networkDetails, stats) => {
+        this.handleNetworkError(
+          context,
+          networkDetails,
+          false,
+          response,
+          stats,
+        );
+      },
+      onTimeout: (stats, context, networkDetails) => {
+        this.handleNetworkError(
+          context,
+          networkDetails,
+          true,
+          undefined,
+          stats,
+        );
+      },
     };
 
     // logger.debug(`[playlist-loader]: Calling internal loader delegate for URL: ${context.url}`);
@@ -307,116 +383,107 @@ class PlaylistLoader {
     loader.load(context, loaderConfig, loaderCallbacks);
   }
 
-  private loadsuccess(
-    response: LoaderResponse,
-    stats: LoaderStats,
-    context: PlaylistLoaderContext,
-    networkDetails: any = null
-  ): void {
-    if (context.isSidxRequest) {
-      this.handleSidxRequest(response, context);
-      this.handlePlaylistLoaded(response, stats, context, networkDetails);
+  private checkAutostartLoad() {
+    if (!this.hls) {
       return;
     }
-
-    this.resetInternalLoader(context.type);
-
-    const string = response.data as string;
-
-    // Validate if it is an M3U8 at all
-    if (string.indexOf('#EXTM3U') !== 0) {
-      this.handleManifestParsingError(
-        response,
-        context,
-        'no EXTM3U delimiter',
-        networkDetails
+    const {
+      config: { autoStartLoad, startPosition },
+      forceStartLoad,
+    } = this.hls;
+    if (autoStartLoad || forceStartLoad) {
+      this.hls.logger.log(
+        `${autoStartLoad ? 'auto' : 'force'} startLoad with configured startPosition ${startPosition}`,
       );
-      return;
+      this.hls.startLoad(startPosition);
     }
-
-    stats.parsing.start = performance.now();
-    // Check if chunk-list or master. handle empty chunk list case (first EXTINF not signaled, but TARGETDURATION present)
-    if (
-      string.indexOf('#EXTINF:') > 0 ||
-      string.indexOf('#EXT-X-TARGETDURATION:') > 0
-    ) {
-      this.handleTrackOrLevelPlaylist(response, stats, context, networkDetails);
-    } else {
-      this.handleMasterPlaylist(response, stats, context, networkDetails);
-    }
-  }
-
-  private loaderror(
-    response: LoaderResponse,
-    context: PlaylistLoaderContext,
-    networkDetails: any = null
-  ): void {
-    this.handleNetworkError(context, networkDetails, false, response);
-  }
-
-  private loadtimeout(
-    stats: LoaderStats,
-    context: PlaylistLoaderContext,
-    networkDetails: any = null
-  ): void {
-    this.handleNetworkError(context, networkDetails, true);
   }
 
   private handleMasterPlaylist(
     response: LoaderResponse,
     stats: LoaderStats,
     context: PlaylistLoaderContext,
-    networkDetails: any
+    networkDetails: NullableNetworkDetails,
   ): void {
     const hls = this.hls;
     const string = response.data as string;
 
     const url = getResponseUrl(response, context);
 
-    const { levels, sessionData } = M3U8Parser.parseMasterPlaylist(string, url);
-    if (!levels.length) {
+    const parsedResult = M3U8Parser.parseMasterPlaylist(string, url);
+
+    if (parsedResult.playlistParsingError) {
+      stats.parsing.end = performance.now();
       this.handleManifestParsingError(
         response,
         context,
-        'no level found in manifest',
-        networkDetails
+        parsedResult.playlistParsingError,
+        networkDetails,
+        stats,
       );
       return;
     }
 
-    // multi level playlist, parse level info
-    const audioGroups = levels.map((level: LevelParsed) => ({
-      id: level.attrs.AUDIO,
-      audioCodec: level.audioCodec,
-    }));
+    const {
+      contentSteering,
+      levels,
+      iframeVariants,
+      sessionData,
+      sessionKeys,
+      startTimeOffset,
+      variableList,
+    } = parsedResult;
 
-    const subtitleGroups = levels.map((level: LevelParsed) => ({
-      id: level.attrs.SUBTITLES,
-      textCodec: level.textCodec,
-    }));
+    this.variableList = variableList;
 
-    const audioTracks = M3U8Parser.parseMasterPlaylistMedia(
-      string,
-      url,
-      'AUDIO',
-      audioGroups
-    );
-    const subtitles = M3U8Parser.parseMasterPlaylistMedia(
-      string,
-      url,
-      'SUBTITLES',
-      subtitleGroups
-    );
-    const captions = M3U8Parser.parseMasterPlaylistMedia(
-      string,
-      url,
-      'CLOSED-CAPTIONS'
-    );
+    // Treat unknown codec as audio or video codec based on passing `isTypeSupported` check
+    // (allows for playback of any supported codec even if not indexed in utils/codecs)
+    levels.forEach((levelParsed: LevelParsed) => {
+      const { unknownCodecs } = levelParsed;
+      if (unknownCodecs) {
+        const { preferManagedMediaSource } = this.hls.config;
+        let { audioCodec, videoCodec } = levelParsed;
+        for (let i = unknownCodecs.length; i--; ) {
+          const unknownCodec = unknownCodecs[i];
+          if (
+            areCodecsMediaSourceSupported(
+              unknownCodec,
+              'audio',
+              preferManagedMediaSource,
+            )
+          ) {
+            levelParsed.audioCodec = audioCodec = audioCodec
+              ? `${audioCodec},${unknownCodec}`
+              : unknownCodec;
+            sampleEntryCodesISO.audio[audioCodec.substring(0, 4)] = 2;
+            unknownCodecs.splice(i, 1);
+          } else if (
+            areCodecsMediaSourceSupported(
+              unknownCodec,
+              'video',
+              preferManagedMediaSource,
+            )
+          ) {
+            levelParsed.videoCodec = videoCodec = videoCodec
+              ? `${videoCodec},${unknownCodec}`
+              : unknownCodec;
+            sampleEntryCodesISO.video[videoCodec.substring(0, 4)] = 2;
+            unknownCodecs.splice(i, 1);
+          }
+        }
+      }
+    });
+
+    const {
+      AUDIO: audioTracks = [],
+      SUBTITLES: subtitles,
+      'CLOSED-CAPTIONS': captions,
+    } = M3U8Parser.parseMasterPlaylistMedia(string, url, parsedResult);
 
     if (audioTracks.length) {
       // check if we have found an audio track embedded in main playlist (audio track without URI attribute)
       const embeddedAudioFound: boolean = audioTracks.some(
-        (audioTrack) => !audioTrack.url
+        (audioTrack) => !audioTrack.url,
       );
 
       // if no embedded audio track defined, but audio codec signaled in quality level,
@@ -428,32 +495,37 @@ class PlaylistLoader {
         levels[0].audioCodec &&
         !levels[0].attrs.AUDIO
       ) {
-        logger.log(
-          '[playlist-loader]: audio codec signaled in quality level, but no embedded audio track signaled, create one'
+        this.hls.logger.log(
+          '[playlist-loader]: audio codec signaled in quality level, but no embedded audio track signaled, create one',
         );
         audioTracks.unshift({
           type: 'main',
           name: 'main',
+          groupId: 'main',
           default: false,
           autoselect: false,
           forced: false,
           id: -1,
-          attrs: new AttrList({}),
+          attrs: new AttrList({}) as MediaAttributes,
           bitrate: 0,
           url: '',
         });
       }
     }
-
     hls.trigger(Events.MANIFEST_LOADED, {
       levels,
       audioTracks,
       subtitles,
+      iframeVariants,
       captions,
+      contentSteering,
       url,
       stats,
       networkDetails,
       sessionData,
+      sessionKeys,
+      startTimeOffset,
+      variableList,
     });
   }
 
@@ -461,40 +533,33 @@ class PlaylistLoader {
     response: LoaderResponse,
     stats: LoaderStats,
     context: PlaylistLoaderContext,
-    networkDetails: any
+    networkDetails: NullableNetworkDetails,
+    loader: Loader<PlaylistLoaderContext> | undefined,
   ): void {
     const hls = this.hls;
     const { id, level, type } = context;
 
     const url = getResponseUrl(response, context);
-    const levelUrlId = Number.isFinite(id as number) ? id : 0;
-    const levelId = Number.isFinite(level as number) ? level : levelUrlId;
+    const levelId = Number.isFinite(level as number)
+      ? (level as number)
+      : Number.isFinite(id as number)
+        ? (id as number)
+        : 0;
     const levelType = mapContextToLevelType(context);
-    const levelDetails: LevelDetails = M3U8Parser.parseLevelPlaylist(
+    const levelDetails = M3U8Parser.parseLevelPlaylist(
       response.data as string,
       url,
-      levelId!,
+      levelId,
       levelType,
-      levelUrlId!
+      0,
+      this.variableList,
     );
-
-    if (!levelDetails.fragments.length) {
-      hls.trigger(Events.ERROR, {
-        type: ErrorTypes.NETWORK_ERROR,
-        details: ErrorDetails.LEVEL_EMPTY_ERROR,
-        fatal: false,
-        url: url,
-        reason: 'no fragments found in level',
-        level: typeof context.level === 'number' ? context.level : undefined,
-      });
-      return;
-    }
 
     // We have done our first request (Manifest-type) and receive
     // not a master playlist but a chunk-list (track/level)
     // We fire the manifest-loaded event anyway with the parsed level-details
     // by creating a single-level structure for it.
-    if (type === PlaylistContextType.MANIFEST) {
+    if (type === LoaderContextType.MANIFEST) {
       const singleLevel: LevelParsed = {
         attrs: new AttrList({}),
         bitrate: 0,
@@ -502,133 +567,109 @@ class PlaylistLoader {
         name: '',
         url,
       };
+      levelDetails.requestScheduled =
+        stats.loading.start + computeReloadInterval(levelDetails, 0);
 
       hls.trigger(Events.MANIFEST_LOADED, {
         levels: [singleLevel],
         audioTracks: [],
+        iframeVariants: [],
         url,
         stats,
         networkDetails,
         sessionData: null,
+        sessionKeys: null,
+        contentSteering: null,
+        startTimeOffset: null,
+        variableList: null,
       });
     }
 
     // save parsing time
     stats.parsing.end = performance.now();
 
-    // in case we need SIDX ranges
-    // return early after calling load for
-    // the SIDX box.
-    if (levelDetails.needSidxRanges) {
-      const sidxUrl = (levelDetails.initSegment as Fragment).url as string;
-      this.load({
-        url: sidxUrl,
-        isSidxRequest: true,
-        type,
-        level,
-        levelDetails,
-        id,
-        groupId: null,
-        rangeStart: 0,
-        rangeEnd: 2048,
-        responseType: 'arraybuffer',
-        deliveryDirectives: null,
-      });
-      return;
-    }
-
     // extend the context with the new levelDetails property
     context.levelDetails = levelDetails;
 
-    this.handlePlaylistLoaded(response, stats, context, networkDetails);
-  }
-
-  private handleSidxRequest(
-    response: LoaderResponse,
-    context: PlaylistLoaderContext
-  ): void {
-    const sidxInfo = parseSegmentIndex(
-      new Uint8Array(response.data as ArrayBuffer)
-    );
-    // if provided fragment does not contain sidx, early return
-    if (!sidxInfo) {
-      return;
-    }
-    const sidxReferences = sidxInfo.references;
-    const levelDetails = context.levelDetails as LevelDetails;
-    sidxReferences.forEach((segmentRef, index) => {
-      const segRefInfo = segmentRef.info;
-      const frag = levelDetails.fragments[index];
-
-      if (frag.byteRange.length === 0) {
-        frag.setByteRange(
-          String(1 + segRefInfo.end - segRefInfo.start) +
-            '@' +
-            String(segRefInfo.start)
-        );
-      }
-    });
-    (levelDetails.initSegment as Fragment).setByteRange(
-      String(sidxInfo.moovEndOffset) + '@0'
+    this.handlePlaylistLoaded(
+      levelDetails,
+      response,
+      stats,
+      context,
+      networkDetails,
+      loader,
     );
   }
 
   private handleManifestParsingError(
     response: LoaderResponse,
     context: PlaylistLoaderContext,
-    reason: string,
-    networkDetails: any
+    error: Error,
+    networkDetails: NullableNetworkDetails,
+    stats: LoaderStats,
   ): void {
     this.hls.trigger(Events.ERROR, {
       type: ErrorTypes.NETWORK_ERROR,
       details: ErrorDetails.MANIFEST_PARSING_ERROR,
-      fatal: context.type === PlaylistContextType.MANIFEST,
+      fatal: context.type === LoaderContextType.MANIFEST,
       url: response.url,
-      reason,
+      err: error,
+      error,
+      reason: error.message,
       response,
       context,
       networkDetails,
+      stats,
     });
   }
 
   private handleNetworkError(
     context: PlaylistLoaderContext,
-    networkDetails: any,
+    networkDetails: NullableNetworkDetails,
     timeout = false,
-    response?: LoaderResponse
+    response: { code: number; text: string } | undefined,
+    stats: LoaderStats,
   ): void {
-    logger.warn(
-      `[playlist-loader]: A network ${
-        timeout ? 'timeout' : 'error'
-      } occurred while loading ${context.type} level: ${context.level} id: ${
-        context.id
-      } group-id: "${context.groupId}"`
-    );
+    let message = `A network ${
+      timeout
+        ? 'timeout'
+        : 'error' + (response ? ' (status ' + response.code + ')' : '')
+    } occurred while loading ${context.type}`;
+    if (context.type === LoaderContextType.LEVEL) {
+      message += `: ${context.level} id: ${context.id}`;
+    } else if (
+      context.type === LoaderContextType.AUDIO_TRACK ||
+      context.type === LoaderContextType.SUBTITLE_TRACK
+    ) {
+      message += ` id: ${context.id} group-id: "${context.groupId}"`;
+    }
+    const error = new Error(message);
+    this.hls.logger.warn(`[playlist-loader]: ${message}`);
     let details = ErrorDetails.UNKNOWN;
     let fatal = false;
 
     const loader = this.getInternalLoader(context);
 
     switch (context.type) {
-      case PlaylistContextType.MANIFEST:
+      case LoaderContextType.MANIFEST:
         details = timeout
           ? ErrorDetails.MANIFEST_LOAD_TIMEOUT
           : ErrorDetails.MANIFEST_LOAD_ERROR;
         fatal = true;
         break;
-      case PlaylistContextType.LEVEL:
+      case LoaderContextType.LEVEL:
         details = timeout
           ? ErrorDetails.LEVEL_LOAD_TIMEOUT
           : ErrorDetails.LEVEL_LOAD_ERROR;
         fatal = false;
         break;
-      case PlaylistContextType.AUDIO_TRACK:
+      case LoaderContextType.AUDIO_TRACK:
         details = timeout
           ? ErrorDetails.AUDIO_TRACK_LOAD_TIMEOUT
           : ErrorDetails.AUDIO_TRACK_LOAD_ERROR;
         fatal = false;
         break;
-      case PlaylistContextType.SUBTITLE_TRACK:
+      case LoaderContextType.SUBTITLE_TRACK:
         details = timeout
           ? ErrorDetails.SUBTITLE_TRACK_LOAD_TIMEOUT
           : ErrorDetails.SUBTITLE_LOAD_ERROR;
@@ -647,83 +688,154 @@ class PlaylistLoader {
       url: context.url,
       loader,
       context,
+      error,
       networkDetails,
+      stats,
     };
 
     if (response) {
-      errorData.response = response;
+      let url = context.url;
+      if (networkDetails && 'url' in networkDetails) {
+        url = networkDetails.url;
+      }
+      errorData.response = { url, data: undefined as any, ...response };
     }
 
     this.hls.trigger(Events.ERROR, errorData);
   }
 
   private handlePlaylistLoaded(
+    levelDetails: LevelDetails,
     response: LoaderResponse,
     stats: LoaderStats,
     context: PlaylistLoaderContext,
-    networkDetails: any
+    networkDetails: NullableNetworkDetails,
+    loader: Loader<PlaylistLoaderContext> | undefined,
   ): void {
-    const {
-      type,
-      level,
-      id,
-      groupId,
-      loader,
-      levelDetails,
-      deliveryDirectives,
-    } = context;
-
-    if (!levelDetails?.targetduration) {
-      this.handleManifestParsingError(
+    const hls = this.hls;
+    const { type, level, levelOrTrack, id, groupId, deliveryDirectives } =
+      context;
+    const url = getResponseUrl(response, context);
+    const parent = mapContextToLevelType(context);
+    let levelIndex =
+      typeof context.level === 'number' && parent === PlaylistLevelType.MAIN
+        ? (level as number)
+        : undefined;
+    if (
+      __USE_IFRAMES__ &&
+      levelOrTrack &&
+      'iframes' in levelOrTrack &&
+      levelOrTrack.iframes &&
+      !levelDetails.iframesOnly
+    ) {
+      levelDetails.playlistParsingError = new Error(
+        `EXT-X-I-FRAME-STREAM-INF media playlist MUST contain an EXT-X-I-FRAMES-ONLY tag`,
+      );
+      levelDetails.iframesOnly = true;
+    }
+    const error = levelDetails.playlistParsingError;
+    if (error) {
+      this.hls.logger.warn(`${error} ${levelDetails.url}`);
+      if (!hls.config.ignorePlaylistParsingErrors) {
+        hls.trigger(Events.ERROR, {
+          type: ErrorTypes.NETWORK_ERROR,
+          details: ErrorDetails.LEVEL_PARSING_ERROR,
+          fatal: false,
+          url,
+          error,
+          reason: error.message,
+          response,
+          context,
+          level: levelIndex,
+          parent,
+          networkDetails,
+          stats,
+        });
+        return;
+      }
+      levelDetails.playlistParsingError = null;
+    }
+    if (!levelDetails.fragments.length) {
+      const error = (levelDetails.playlistParsingError = new Error(
+        'No Segments found in Playlist',
+      ));
+      hls.trigger(Events.ERROR, {
+        type: ErrorTypes.NETWORK_ERROR,
+        details: ErrorDetails.LEVEL_EMPTY_ERROR,
+        fatal: false,
+        url,
+        error,
+        reason: error.message,
         response,
         context,
-        'invalid target duration',
-        networkDetails
-      );
-      return;
-    }
-    if (!loader) {
+        level: levelIndex,
+        parent,
+        networkDetails,
+        stats,
+      });
       return;
     }
 
-    // Avoid repeated browser error log `Refused to get unsafe header "age"` when unnecessary or past attempts failed
-    const checkAgeHeader = this.checkAgeHeader && levelDetails.live;
-    const ageHeader: string | null = checkAgeHeader
-      ? loader.getResponseHeader('age')
-      : null;
-    levelDetails.ageHeader = ageHeader ? parseFloat(ageHeader) : 0;
-    this.checkAgeHeader = !!ageHeader;
+    if (levelDetails.live && loader) {
+      if (loader.getCacheAge) {
+        levelDetails.ageHeader = loader.getCacheAge() || 0;
+      }
+      if (!loader.getCacheAge || isNaN(levelDetails.ageHeader)) {
+        levelDetails.ageHeader = 0;
+      }
+    }
 
     switch (type) {
-      case PlaylistContextType.MANIFEST:
-      case PlaylistContextType.LEVEL:
-        this.hls.trigger(Events.LEVEL_LOADED, {
+      case LoaderContextType.MANIFEST:
+      case LoaderContextType.LEVEL:
+        if (levelIndex) {
+          if (!levelOrTrack) {
+            // fall-through to hls.levels[0]
+            levelIndex = 0;
+          } else {
+            if (levelOrTrack !== hls.levels[levelIndex]) {
+              // correct levelIndex when lower levels were removed from hls.levels
+              const updatedIndex = hls.levels.indexOf(levelOrTrack as Level);
+              if (updatedIndex > -1) {
+                levelIndex = updatedIndex;
+              }
+            }
+          }
+        }
+        hls.trigger(Events.LEVEL_LOADED, {
           details: levelDetails,
-          level: level || 0,
+          levelInfo: (levelOrTrack as Level | null) || hls.levels[0],
+          level: levelIndex || 0,
           id: id || 0,
           stats,
           networkDetails,
           deliveryDirectives,
+          withoutMultiVariant: type === LoaderContextType.MANIFEST,
+          context,
         });
         break;
-      case PlaylistContextType.AUDIO_TRACK:
-        this.hls.trigger(Events.AUDIO_TRACK_LOADED, {
+      case LoaderContextType.AUDIO_TRACK:
+        hls.trigger(Events.AUDIO_TRACK_LOADED, {
           details: levelDetails,
+          track: levelOrTrack as MediaPlaylist,
           id: id || 0,
           groupId: groupId || '',
           stats,
           networkDetails,
           deliveryDirectives,
+          context,
         });
         break;
-      case PlaylistContextType.SUBTITLE_TRACK:
-        this.hls.trigger(Events.SUBTITLE_TRACK_LOADED, {
+      case LoaderContextType.SUBTITLE_TRACK:
+        hls.trigger(Events.SUBTITLE_TRACK_LOADED, {
           details: levelDetails,
+          track: levelOrTrack as MediaPlaylist,
           id: id || 0,
           groupId: groupId || '',
           stats,
           networkDetails,
           deliveryDirectives,
+          context,
         });
         break;
     }

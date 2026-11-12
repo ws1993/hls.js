@@ -1,10 +1,21 @@
-// eslint-disable-next-line import/no-duplicates
-import type { Fragment } from '../loader/fragment';
-// eslint-disable-next-line import/no-duplicates
-import type { Part } from '../loader/fragment';
-import type { LevelDetails } from '../loader/level-details';
-import type { HlsUrlParameters, Level, LevelParsed } from './level';
-import type { MediaPlaylist, MediaPlaylistType } from './media-playlist';
+import type {
+  AttachMediaSourceData,
+  BaseTrackSet,
+  BufferCreatedTrackSet,
+  MediaOverrides,
+  ParsedTrack,
+  SourceBufferName,
+  SourceBufferTrackSet,
+} from './buffer';
+import type { MetadataSample, UserdataSample } from './demuxer';
+import type {
+  HdcpLevel,
+  HlsUrlParameters,
+  Level,
+  LevelAttributes,
+  LevelParsed,
+  VariableMap,
+} from './level';
 import type {
   Loader,
   LoaderContext,
@@ -13,30 +24,66 @@ import type {
   PlaylistLevelType,
   PlaylistLoaderContext,
 } from './loader';
-import type { Track, TrackSet } from './track';
-import type { SourceBufferName } from './buffer';
+import type { MediaPlaylist, MediaPlaylistType } from './media-playlist';
 import type { ChunkMetadata } from './transmuxer';
-import type { LoadStats } from '../loader/load-stats';
+import type { SteeringManifest } from '../controller/content-steering-controller';
+import type { IErrorAction } from '../controller/error-controller';
+import type { HlsAssetPlayer } from '../controller/interstitial-player';
+import type {
+  InterstitialScheduleDurations,
+  InterstitialScheduleItem,
+} from '../controller/interstitials-schedule';
 import type { ErrorDetails, ErrorTypes } from '../errors';
-import type { MetadataSample, UserdataSample } from './demuxer';
-import type { AttrList } from '../utils/attr-list';
 import type { HlsListeners } from '../events';
+import type { NullableNetworkDetails } from './network-details';
+import type { Fragment, MediaFragment, Part } from '../loader/fragment';
+import type {
+  AssetListJSON,
+  InterstitialAssetItem,
+  InterstitialEvent,
+  InterstitialEventWithAssetList,
+} from '../loader/interstitial-event';
+import type { KeyLoaderInfo } from '../loader/key-loader';
+import type { LevelDetails } from '../loader/level-details';
+import type { LevelKey } from '../loader/level-key';
+import type { LoadStats } from '../loader/load-stats';
+import type { AttrList } from '../utils/attr-list';
+import type { BufferInfo } from '../utils/buffer-helper';
+import type { TimestampOffset } from '../utils/timescale-conversion';
 
 export interface MediaAttachingData {
   media: HTMLMediaElement;
+  mediaSource?: MediaSource | null;
+  tracks?: SourceBufferTrackSet;
+  overrides?: MediaOverrides;
 }
 
 export interface MediaAttachedData {
   media: HTMLMediaElement;
+  mediaSource?: MediaSource;
+}
+
+export interface MediaDetachingData {
+  transferMedia?: AttachMediaSourceData | null;
+}
+
+export interface MediaDetachedData {
+  transferMedia?: AttachMediaSourceData | null;
+}
+
+export interface MediaEndedData {
+  stalled: boolean;
 }
 
 export interface BufferCodecsData {
-  video?: Track;
-  audio?: Track;
+  video?: ParsedTrack;
+  audio?: ParsedTrack;
+  audiovideo?: ParsedTrack;
+  tracks?: BaseTrackSet;
 }
 
 export interface BufferCreatedData {
-  tracks: TrackSet;
+  tracks: BufferCreatedTrackSet;
 }
 
 export interface BufferAppendingData {
@@ -44,8 +91,9 @@ export interface BufferAppendingData {
   frag: Fragment;
   part: Part | null;
   chunkMeta: ChunkMetadata;
+  offset?: number | undefined;
   parent: PlaylistLevelType;
-  data: Uint8Array;
+  data: Uint8Array<ArrayBuffer>;
 }
 
 export interface BufferAppendedData {
@@ -58,38 +106,55 @@ export interface BufferAppendedData {
 }
 
 export interface BufferEOSData {
-  type?: SourceBufferName;
+  type: SourceBufferName | null;
 }
 
 export interface BufferFlushingData {
   startOffset: number;
   endOffset: number;
+  endOffsetSubtitles?: number;
   type: SourceBufferName | null;
 }
 
 export interface BufferFlushedData {
   type: SourceBufferName;
+  start: number;
+  end: number;
+  error?: Error;
 }
 
 export interface ManifestLoadingData {
   url: string;
 }
 
+export type ContentSteeringOptions = {
+  uri: string;
+  pathwayId: string;
+};
+
 export interface ManifestLoadedData {
   audioTracks: MediaPlaylist[];
   captions?: MediaPlaylist[];
+  contentSteering: ContentSteeringOptions | null;
+  iframeVariants: LevelParsed[];
   levels: LevelParsed[];
-  networkDetails: any;
+  networkDetails: NullableNetworkDetails;
   sessionData: Record<string, AttrList> | null;
+  sessionKeys: LevelKey[] | null;
+  startTimeOffset: number | null;
   stats: LoaderStats;
   subtitles?: MediaPlaylist[];
   url: string;
+  variableList: VariableMap | null;
 }
 
 export interface ManifestParsedData {
   levels: Level[];
   audioTracks: MediaPlaylist[];
   subtitleTracks: MediaPlaylist[];
+  iframeVariants: LevelParsed[];
+  sessionData: Record<string, AttrList> | null;
+  sessionKeys: LevelKey[] | null;
   firstLevel: number;
   stats: LoaderStats;
   audio: boolean;
@@ -97,8 +162,32 @@ export interface ManifestParsedData {
   altAudio: boolean;
 }
 
-export interface LevelSwitchingData extends Omit<Level, '_urlId'> {
+export interface LevelSwitchingData {
   level: number;
+  attrs: LevelAttributes;
+  details: LevelDetails | undefined;
+  bitrate: number;
+  averageBitrate: number;
+  maxBitrate: number;
+  realBitrate: number;
+  width: number;
+  height: number;
+  codecSet: string;
+  audioCodec: string | undefined;
+  videoCodec: string | undefined;
+  audioGroups: (string | undefined)[] | undefined;
+  subtitleGroups: (string | undefined)[] | undefined;
+  loaded: { bytes: number; duration: number } | undefined;
+  loadError: number;
+  fragmentError: number;
+  name: string | undefined;
+  id: number;
+  uri: string;
+  // Deprecated (retained for backwards compatibility)
+  url: string[];
+  urlId: 0;
+  audioGroupIds: (string | undefined)[] | undefined;
+  textGroupIds: (string | undefined)[] | undefined;
 }
 
 export interface LevelSwitchedData {
@@ -108,6 +197,7 @@ export interface LevelSwitchedData {
 export interface TrackLoadingData {
   id: number;
   groupId: string;
+  track: MediaPlaylist;
   url: string;
   deliveryDirectives: HlsUrlParameters | null;
 }
@@ -115,6 +205,8 @@ export interface TrackLoadingData {
 export interface LevelLoadingData {
   id: number;
   level: number;
+  levelInfo: Level;
+  pathwayId: string | undefined;
   url: string;
   deliveryDirectives: HlsUrlParameters | null;
 }
@@ -123,23 +215,40 @@ export interface TrackLoadedData {
   details: LevelDetails;
   id: number;
   groupId: string;
-  networkDetails: any;
+  networkDetails: NullableNetworkDetails;
   stats: LoaderStats;
   deliveryDirectives: HlsUrlParameters | null;
+  track: MediaPlaylist;
+  context?: PlaylistLoaderContext;
 }
 
 export interface LevelLoadedData {
   details: LevelDetails;
   id: number;
   level: number;
-  networkDetails: any;
+  levelInfo: Level;
+  networkDetails: NullableNetworkDetails;
   stats: LoaderStats;
   deliveryDirectives: HlsUrlParameters | null;
+  withoutMultiVariant?: boolean;
+  context?: PlaylistLoaderContext;
 }
 
 export interface LevelUpdatedData {
   details: LevelDetails;
   level: number;
+}
+
+export interface AudioTrackUpdatedData {
+  details: LevelDetails;
+  id: number;
+  groupId: string;
+}
+
+export interface SubtitleTrackUpdatedData {
+  details: LevelDetails;
+  id: number;
+  groupId: string;
 }
 
 export interface LevelPTSUpdatedData {
@@ -148,19 +257,16 @@ export interface LevelPTSUpdatedData {
   drift: number;
   type: string;
   frag: Fragment;
+  part: Part | null;
   start: number;
   end: number;
 }
 
-export interface AudioTrackSwitchingData {
-  url: string;
-  type: MediaPlaylistType | 'main';
-  id: number;
+export interface AudioTrackSwitchingData extends MediaPlaylist {
+  flushImmediate?: boolean;
 }
 
-export interface AudioTrackSwitchedData {
-  id: number;
-}
+export interface AudioTrackSwitchedData extends MediaPlaylist {}
 
 export interface AudioTrackLoadedData extends TrackLoadedData {}
 
@@ -173,9 +279,11 @@ export interface SubtitleTracksUpdatedData {
 }
 
 export interface SubtitleTrackSwitchData {
-  url?: string;
-  type?: MediaPlaylistType | 'main';
   id: number;
+  name?: string;
+  groupId?: string;
+  type?: MediaPlaylistType | 'main';
+  url?: string;
 }
 
 export interface SubtitleTrackLoadedData extends TrackLoadedData {}
@@ -187,10 +295,12 @@ export interface TrackSwitchedData {
 export interface SubtitleFragProcessed {
   success: boolean;
   frag: Fragment;
+  part: Part | null;
 }
 
 export interface FragChangedData {
-  frag: Fragment;
+  frag: MediaFragment;
+  previousFrag: MediaFragment | null;
 }
 
 export interface FPSDropData {
@@ -204,25 +314,46 @@ export interface FPSDropLevelCappingData {
   level: number;
 }
 
+export interface MaxAutoLevelUpdatedData {
+  autoLevelCapping: number;
+  levels: Level[] | null;
+  maxAutoLevel: number;
+  minAutoLevel: number;
+  maxHdcpLevel: HdcpLevel;
+}
+
 export interface ErrorData {
   type: ErrorTypes;
   details: ErrorDetails;
+  error: Error;
   fatal: boolean;
+  appendsWithoutProgress?: number;
+  errorAction?: IErrorAction;
   buffer?: number;
+  bufferInfo?: BufferInfo;
   bytes?: number;
+  chunkMeta?: ChunkMetadata;
   context?: PlaylistLoaderContext;
-  error?: Error;
+  decryptdata?: LevelKey;
   event?: keyof HlsListeners | 'demuxerWorker';
   frag?: Fragment;
+  part?: Part | null;
   level?: number | undefined;
   levelRetry?: boolean;
   loader?: Loader<LoaderContext>;
-  networkDetails?: any;
+  networkDetails?: NullableNetworkDetails;
+  stalled?: { start: number };
+  stats?: LoaderStats;
   mimeType?: string;
   reason?: string;
   response?: LoaderResponse;
   url?: string;
   parent?: PlaylistLevelType;
+  sourceBufferName?: SourceBufferName;
+  interstitial?: InterstitialEvent;
+  /**
+   * @deprecated Use ErrorData.error
+   */
   err?: {
     // comes from transmuxer interface
     message: string;
@@ -232,6 +363,7 @@ export interface ErrorData {
 export interface SubtitleFragProcessedData {
   success: boolean;
   frag: Fragment;
+  part: Part | null;
   error?: Error;
 }
 
@@ -239,26 +371,30 @@ export interface CuesParsedData {
   type: 'captions' | 'subtitles';
   cues: any;
   track: string;
+  closedCaptions?: MediaPlaylist | undefined;
+  subtitleTrack?: MediaPlaylist;
 }
 
-export interface NonNativeTextTrack {
+export type NonNativeTextTrack = {
   _id?: string;
-  label: any;
+  label: string;
   kind: string;
   default: boolean;
   closedCaptions?: MediaPlaylist;
   subtitleTrack?: MediaPlaylist;
-}
+};
 
 export interface NonNativeTextTracksData {
   tracks: Array<NonNativeTextTrack>;
 }
 
 export interface InitPTSFoundData {
-  id: string;
-  frag: Fragment;
+  timestampOffsets: TimestampOffset[];
+  id: PlaylistLevelType;
+  frag: MediaFragment;
   initPTS: number;
   timescale: number;
+  trackId: number;
 }
 
 export interface FragLoadingData {
@@ -277,7 +413,7 @@ export interface FragLoadedData {
   frag: Fragment;
   part: Part | null;
   payload: ArrayBuffer;
-  networkDetails: unknown;
+  networkDetails: NullableNetworkDetails;
 }
 
 export interface PartsLoadedData {
@@ -288,6 +424,7 @@ export interface PartsLoadedData {
 
 export interface FragDecryptedData {
   frag: Fragment;
+  part: Part | null;
   payload: ArrayBuffer;
   stats: {
     tstart: number;
@@ -300,25 +437,29 @@ export interface FragParsingInitSegmentData {}
 export interface FragParsingUserdataData {
   id: string;
   frag: Fragment;
+  details: LevelDetails;
   samples: UserdataSample[];
 }
 
 export interface FragParsingMetadataData {
   id: string;
   frag: Fragment;
+  details: LevelDetails;
   samples: MetadataSample[];
 }
 
 export interface FragParsedData {
   frag: Fragment;
   part: Part | null;
+  chunkMeta: ChunkMetadata;
 }
 
 export interface FragBufferedData {
   stats: LoadStats;
   frag: Fragment;
   part: Part | null;
-  id: string;
+  id: PlaylistLevelType;
+  chunkMeta?: ChunkMetadata;
 }
 
 export interface LevelsUpdatedData {
@@ -331,6 +472,7 @@ export interface KeyLoadingData {
 
 export interface KeyLoadedData {
   frag: Fragment;
+  keyInfo: KeyLoaderInfo;
 }
 
 export interface BackBufferData {
@@ -338,6 +480,87 @@ export interface BackBufferData {
 }
 
 /**
- * Deprecated; please use BackBufferData
+ * @deprecated Use BackBufferData
  */
 export interface LiveBackBufferData extends BackBufferData {}
+
+export interface SteeringManifestLoadedData {
+  steeringManifest: SteeringManifest;
+  url: string;
+}
+
+export interface AssetListLoadingData {
+  event: InterstitialEventWithAssetList;
+}
+
+export interface AssetListLoadedData {
+  event: InterstitialEventWithAssetList;
+  assetListResponse: AssetListJSON;
+  networkDetails: NullableNetworkDetails;
+}
+
+export interface InterstitialsUpdatedData {
+  events: InterstitialEvent[];
+  schedule: InterstitialScheduleItem[];
+  durations: InterstitialScheduleDurations;
+  removedIds: string[];
+}
+
+export interface InterstitialsBufferedToBoundaryData {
+  events: InterstitialEvent[];
+  schedule: InterstitialScheduleItem[];
+  bufferingIndex: number;
+  playingIndex: number;
+}
+
+export interface InterstitialAssetPlayerCreatedData {
+  asset: InterstitialAssetItem;
+  assetListIndex: number;
+  assetListResponse?: AssetListJSON;
+  event: InterstitialEvent;
+  player: HlsAssetPlayer;
+}
+
+export interface InterstitialStartedData {
+  event: InterstitialEvent;
+  schedule: InterstitialScheduleItem[];
+  scheduleIndex: number;
+}
+
+export interface InterstitialEndedData {
+  event: InterstitialEvent;
+  schedule: InterstitialScheduleItem[];
+  scheduleIndex: number;
+}
+
+export interface InterstitialAssetStartedData {
+  asset: InterstitialAssetItem;
+  assetListIndex: number;
+  event: InterstitialEvent;
+  schedule: InterstitialScheduleItem[];
+  scheduleIndex: number;
+  player: HlsAssetPlayer;
+}
+
+export interface InterstitialAssetEndedData {
+  asset: InterstitialAssetItem;
+  assetListIndex: number;
+  event: InterstitialEvent;
+  schedule: InterstitialScheduleItem[];
+  scheduleIndex: number;
+  player: HlsAssetPlayer;
+}
+
+export type InterstitialAssetErrorData = {
+  asset: InterstitialAssetItem | null;
+  assetListIndex: number;
+  event: InterstitialEvent | null;
+  schedule: InterstitialScheduleItem[] | null;
+  scheduleIndex: number;
+  player: HlsAssetPlayer | null;
+} & ErrorData;
+
+export interface InterstitialsPrimaryResumed {
+  schedule: InterstitialScheduleItem[];
+  scheduleIndex: number;
+}

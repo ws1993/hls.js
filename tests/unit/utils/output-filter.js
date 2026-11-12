@@ -1,3 +1,5 @@
+import { expect } from 'chai';
+import sinon from 'sinon';
 import OutputFilter from '../../../src/utils/output-filter';
 
 describe('OutputFilter', function () {
@@ -32,7 +34,7 @@ describe('OutputFilter', function () {
       1,
       0,
       1,
-      lastScreen
+      lastScreen,
     );
   });
 
@@ -47,7 +49,7 @@ describe('OutputFilter', function () {
       1,
       0,
       4,
-      lastScreen
+      lastScreen,
     );
   });
 

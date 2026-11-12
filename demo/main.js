@@ -1,11 +1,12 @@
-/* global $, Hls, __NETLIFY__ */
+/* global $, Hls, __CLOUDFLARE_PAGES__ */
 /* eslint camelcase: 0 */
 
+import { pack } from 'jsonpack';
 import 'promise-polyfill/src/polyfill';
 import { sortObject, copyTextToClipboard } from './demo-utils';
 import { TimelineChart } from './chart/timeline-chart';
 
-const NETLIFY = __NETLIFY__; // replaced in build
+const CLOUDFLARE_PAGES = __CLOUDFLARE_PAGES__; // replaced in build
 
 const STORAGE_KEYS = {
   Editor_Persistence: 'hlsjs:config-editor-persist',
@@ -18,11 +19,14 @@ const testStreams = require('../tests/test-streams');
 const defaultTestStreamUrl = testStreams[Object.keys(testStreams)[0]].url;
 const sourceURL = decodeURIComponent(getURLParam('src', defaultTestStreamUrl));
 
-let demoConfig = getURLParam('demoConfig', null);
-if (demoConfig) {
-  demoConfig = JSON.parse(atob(demoConfig));
-} else {
-  demoConfig = {};
+let demoConfig = {};
+const demoConfigParam = getURLParam('demoConfig', null);
+if (demoConfigParam) {
+  try {
+    demoConfig = JSON.parse(atob(demoConfigParam));
+  } catch (error) {
+    console.warn('Failed to parse demoConfig:', error);
+  }
 }
 
 const hlsjsDefaults = {
@@ -31,6 +35,18 @@ const hlsjsDefaults = {
   lowLatencyMode: true,
   backBufferLength: 60 * 1.5,
 };
+
+const hlsjsConfigParam = getURLParam('hlsjsConfig', null);
+let hlsjsConfig = hlsjsDefaults;
+let hlsjsConfigLoadedFromUrl = false;
+if (hlsjsConfigParam) {
+  try {
+    hlsjsConfig = JSON.parse(atob(hlsjsConfigParam));
+    hlsjsConfigLoadedFromUrl = true;
+  } catch (error) {
+    console.warn('Failed to parse hlsjsConfig:', error);
+  }
+}
 
 let enableStreaming = getDemoConfigPropOrDefault('enableStreaming', true);
 let autoRecoverError = getDemoConfigPropOrDefault('autoRecoverError', true);
@@ -42,7 +58,7 @@ let stopOnStall = getDemoConfigPropOrDefault('stopOnStall', false);
 let bufferingIdx = -1;
 let selectedTestStream = null;
 
-let video = document.querySelector('#video');
+const video = document.querySelector('#video');
 const startTime = Date.now();
 
 let lastSeekingIdx;
@@ -174,26 +190,24 @@ $(document).ready(function () {
   $('#dumpfMP4').prop('checked', dumpfMP4);
   $('#levelCapping').val(levelCapping);
 
-  // link to version on npm if canary
-  // github branch for a branch version
-  // github tag for a normal tag
-  // github PR for a pr
+  // If cloudflare pages build link to branch
+  // If not a stable tag link to npm
+  // otherwise link to github tag
   function getVersionLink(version) {
-    const alphaRegex = /[-.]0\.alpha\./;
-    if (alphaRegex.test(version)) {
+    const noneStable = version.includes('-');
+    if (CLOUDFLARE_PAGES) {
+      return `https://github.com/video-dev/hls.js/tree/${encodeURIComponent(
+        CLOUDFLARE_PAGES.branch
+      )}`;
+    } else if (noneStable) {
       return `https://www.npmjs.com/package/hls.js/v/${encodeURIComponent(
         version
       )}`;
-    } else if (NETLIFY.reviewID) {
-      return `https://github.com/video-dev/hls.js/pull/${NETLIFY.reviewID}`;
-    } else if (NETLIFY.branch) {
-      return `https://github.com/video-dev/hls.js/tree/${encodeURIComponent(
-        NETLIFY.branch
+    } else {
+      return `https://github.com/video-dev/hls.js/releases/tag/v${encodeURIComponent(
+        version
       )}`;
     }
-    return `https://github.com/video-dev/hls.js/releases/tag/v${encodeURIComponent(
-      version
-    )}`;
   }
 
   const version = Hls.version;
@@ -203,7 +217,7 @@ $(document).ready(function () {
       .attr('rel', 'noopener noreferrer')
       .attr('href', getVersionLink(version))
       .text('v' + version);
-    $('.title').append($a);
+    $('.title').append(' ').append($a);
   }
 
   $('#streamURL').val(sourceURL);
@@ -223,6 +237,7 @@ $(document).ready(function () {
   $('#metricsButtonWindow').toggle(self.windowSliding);
   $('#metricsButtonFixed').toggle(!self.windowSliding);
 
+  addVideoEventListeners(video);
   loadSelectedStream();
 
   let tabIndexesCSV = localStorage.getItem(STORAGE_KEYS.demo_tabs);
@@ -234,6 +249,9 @@ $(document).ready(function () {
       toggleTab($('.demo-tab-btn')[parseInt(indexString) || 0], true);
     });
   }
+  $(self).on('popstate', function () {
+    self.location.reload();
+  });
 });
 
 function setupGlobals() {
@@ -301,6 +319,17 @@ function loadSelectedStream() {
 
   url = $('#streamURL').val();
 
+  // Check if the URL is valid to avoid XSS issue.
+  if (url) {
+    try {
+      new URL(url);
+    } catch (error) {
+      $('#streamURL').val('');
+      alert('Invalid URL');
+      return false;
+    }
+  }
+
   setupGlobals();
   hideCanvas();
 
@@ -333,39 +362,14 @@ function loadSelectedStream() {
     updateConfigEditorValue(hlsConfig);
   }
 
-  onDemoConfigChanged();
+  onDemoConfigChanged(true);
   console.log('Using Hls.js config:', hlsConfig);
 
   self.hls = hls = new Hls(hlsConfig);
 
   logStatus('Loading manifest and attaching video element...');
 
-  const expiredTracks = [].filter.call(
-    video.textTracks,
-    (track) => track.kind !== 'metadata'
-  );
-  if (expiredTracks.length) {
-    const kinds = expiredTracks
-      .map((track) => track.kind)
-      .filter((kind, index, self) => self.indexOf(kind) === index);
-    logStatus(
-      `Replacing video element to remove ${kinds.join(' and ')} text tracks`
-    );
-    const videoWithExpiredTextTracks = video;
-    video = videoWithExpiredTextTracks.cloneNode(false);
-    video.removeAttribute('src');
-    video.volume = videoWithExpiredTextTracks.volume;
-    video.muted = videoWithExpiredTextTracks.muted;
-    videoWithExpiredTextTracks.parentNode.insertBefore(
-      video,
-      videoWithExpiredTextTracks
-    );
-    videoWithExpiredTextTracks.parentNode.removeChild(
-      videoWithExpiredTextTracks
-    );
-  }
   addChartEventListeners(hls);
-  addVideoEventListeners(video);
 
   hls.loadSource(url);
   hls.autoLevelCapping = levelCapping;
@@ -535,6 +539,15 @@ function loadSelectedStream() {
   });
 
   hls.on(Hls.Events.FRAG_BUFFERED, function (eventName, data) {
+    const stats =
+      data.part && data.part.stats && data.part.stats.loaded
+        ? data.part.stats
+        : data.frag.stats;
+    if (data.stats.aborted) {
+      console.assert('Aborted request being buffered.', data);
+      return;
+    }
+
     const event = {
       type: data.frag.type + (data.part ? ' part' : ' fragment'),
       id: data.frag.level,
@@ -549,13 +562,15 @@ function loadSelectedStream() {
       bw: Math.round(
         (8 * data.stats.total) /
           (data.stats.buffering.end - data.stats.loading.start)
-      ),
+      ), // bandwidth of this fragment
+      ewma: Math.round(hls.bandwidthEstimate / 1000), // estimated bandwidth
       size: data.stats.total,
     };
     events.load.push(event);
     events.bitrate.push({
       time: self.performance.now() - events.t0,
       bitrate: event.bw,
+      ewma: event.ewma,
       duration: data.frag.duration,
       level: event.id,
     });
@@ -652,10 +667,13 @@ function loadSelectedStream() {
     stats.tagList = data.frag.tagList;
 
     const level = data.frag.level;
-    const autoLevel = data.frag.autoLevel;
+    const autoLevel = hls.autoLevelEnabled;
     if (stats.levelStart === undefined) {
       stats.levelStart = level;
     }
+
+    stats.fragProgramDateTime = data.frag.programDateTime;
+    stats.fragStart = data.frag.start;
 
     if (autoLevel) {
       if (stats.fragChangedAuto) {
@@ -1032,7 +1050,7 @@ function handleVolumeEvent() {
 }
 
 function handleLevelError(data) {
-  var levelObj = data.context || data;
+  const levelObj = data.context || data;
   hls.removeLevel(levelObj.level, levelObj.urlId || 0);
   if (!hls.levels.length) {
     logError('All levels have been removed');
@@ -1205,15 +1223,29 @@ function checkBuffer() {
           log += `Dropped frames: ${video.webkitDroppedFrameCount}\n`;
         }
       }
+      log += `TTFB Estimate: ${hls.ttfbEstimate.toFixed(3)}\n`;
       log += `Bandwidth Estimate: ${hls.bandwidthEstimate.toFixed(3)}\n`;
       if (events.isLive) {
         log +=
           'Live Stats:\n' +
           `  Max Latency: ${hls.maxLatency}\n` +
-          `  Target Latency: ${hls.targetLatency}\n` +
-          `  Latency: ${hls.latency}\n` +
-          `  Edge Stall: ${hls.latencyController.edgeStalled}\n` +
+          `  Target Latency: ${hls.targetLatency.toFixed(3)}\n` +
+          `  Latency: ${hls.latency.toFixed(3)}\n` +
+          `  Drift: ${hls.drift.toFixed(3)} (edge advance rate)\n` +
+          `  Edge Stall: ${hls.latencyController.edgeStalled.toFixed(
+            3
+          )} (playlist refresh over target duration/part)\n` +
           `  Playback rate: ${video.playbackRate.toFixed(2)}\n`;
+        if (stats.fragProgramDateTime) {
+          const currentPDT =
+            stats.fragProgramDateTime +
+            (video.currentTime - stats.fragStart) * 1000;
+          log += `  Program Date Time: ${new Date(currentPDT).toISOString()}`;
+          const pdtLatency = (Date.now() - currentPDT) / 1000;
+          if (pdtLatency > 0) {
+            log += ` (${pdtLatency.toFixed(3)} seconds ago)`;
+          }
+        }
       }
 
       $('#bufferedOut').text(log);
@@ -1243,7 +1275,7 @@ function hideCanvas() {
 
 function getMetrics() {
   const json = JSON.stringify(events);
-  const jsonpacked = self.jsonpack.pack(json);
+  const jsonpacked = pack(json);
   // console.log('packing JSON from ' + json.length + ' to ' + jsonpacked.length + ' bytes');
   return btoa(jsonpacked);
 }
@@ -1254,14 +1286,14 @@ self.copyMetricsToClipBoard = function () {
 
 self.goToMetrics = function () {
   let url = document.URL;
-  url = url.substr(0, url.lastIndexOf('/') + 1) + 'metrics.html';
+  url = url.slice(0, url.lastIndexOf('/') + 1) + 'metrics.html';
   self.open(url, '_blank');
 };
 
 function goToMetricsPermaLink() {
   let url = document.URL;
   const b64 = getMetrics();
-  url = url.substr(0, url.lastIndexOf('/') + 1) + 'metrics.html#data=' + b64;
+  url = url.slice(0, url.lastIndexOf('/') + 1) + 'metrics.html#data=' + b64;
   self.open(url, '_blank');
 }
 
@@ -1361,9 +1393,12 @@ function updateAudioTrackInfo() {
   const buttonEnabled = 'btn-primary" ';
   const buttonDisabled = 'btn-success" ';
   let html1 = '';
+  let html2 = '';
   const audioTrackId = hls.audioTrack;
+  const nextAudioTrackId = hls.nextAudioTrack;
   const len = hls.audioTracks.length;
   const track = hls.audioTracks[audioTrackId];
+  const nextTrack = hls.audioTracks[nextAudioTrackId];
 
   for (let i = 0; i < len; i++) {
     html1 += buttonTemplate;
@@ -1381,10 +1416,30 @@ function updateAudioTrackInfo() {
       '</button>';
   }
 
+  for (let i = 0; i < len; i++) {
+    html2 += buttonTemplate;
+    if (nextAudioTrackId === i) {
+      html2 += buttonEnabled;
+    } else {
+      html2 += buttonDisabled;
+    }
+
+    html2 +=
+      'onclick="hls.nextAudioTrack=' +
+      i +
+      '">' +
+      hls.audioTracks[i].name +
+      '</button>';
+  }
+
   $('#audioTrackLabel').text(
     track ? track.lang || track.name : 'None selected'
   );
   $('#audioTrackControl').html(html1);
+  $('#audioTrackLabel').text(
+    nextTrack ? nextTrack.lang || nextTrack.name : 'None selected'
+  );
+  $('#nextAudioTrackControl').html(html2);
 }
 
 function codecs2label(levelCodecs) {
@@ -1435,14 +1490,14 @@ function getURLParam(sParam, defaultValue) {
       return sParameterName[1] === 'undefined'
         ? undefined
         : sParameterName[1] === 'false'
-        ? false
-        : sParameterName[1];
+          ? false
+          : sParameterName[1];
     }
   }
   return defaultValue;
 }
 
-function onDemoConfigChanged() {
+function onDemoConfigChanged(firstLoad) {
   demoConfig = {
     enableStreaming,
     autoRecoverError,
@@ -1456,14 +1511,22 @@ function onDemoConfigChanged() {
     persistEditorValue();
   }
 
+  updatePermalink(firstLoad);
+}
+
+function updatePermalink(firstLoad) {
   const serializedDemoConfig = btoa(JSON.stringify(demoConfig));
+  const serializedHlsjsConfig = btoa(JSON.stringify(hlsjsConfig));
   const baseURL = document.URL.split('?')[0];
   const streamURL = $('#streamURL').val();
   const permalinkURL = `${baseURL}?src=${encodeURIComponent(
     streamURL
-  )}&demoConfig=${serializedDemoConfig}`;
+  )}&demoConfig=${serializedDemoConfig}&hlsjsConfig=${serializedHlsjsConfig}`;
 
   $('#StreamPermalink').html(`<a href="${permalinkURL}">${permalinkURL}</a>`);
+  if (!firstLoad && self.location.href !== permalinkURL) {
+    self.history.pushState(null, null, permalinkURL);
+  }
 }
 
 function onConfigPersistenceChanged(event) {
@@ -1521,8 +1584,9 @@ function setupConfigEditor() {
   configEditor.setTheme('ace/theme/github');
   configEditor.session.setMode('ace/mode/json');
 
-  const contents = hlsjsDefaults;
+  const contents = hlsjsConfig;
   const shouldRestorePersisted =
+    !hlsjsConfigLoadedFromUrl &&
     JSON.parse(localStorage.getItem(STORAGE_KEYS.Editor_Persistence)) === true;
 
   if (shouldRestorePersisted) {
@@ -1693,6 +1757,8 @@ function updateConfigEditorValue(obj) {
 
 function applyConfigEditorValue() {
   onDemoConfigChanged();
+  hlsjsConfig = getEditorValue({ parse: true });
+  updatePermalink(false);
   loadSelectedStream();
 }
 

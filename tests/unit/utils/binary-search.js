@@ -1,3 +1,4 @@
+import { expect } from 'chai';
 import BinarySearch from '../../../src/utils/binary-search';
 
 describe('binary search util', function () {
@@ -23,7 +24,7 @@ describe('binary search util', function () {
         const item = list[i];
         const foundItem = BinarySearch.search(
           list,
-          buildComparisonFunction(item)
+          buildComparisonFunction(item),
         );
         expect(foundItem).to.equal(item);
       }
@@ -32,7 +33,7 @@ describe('binary search util', function () {
       const item = 1000;
       const foundItem = BinarySearch.search(
         list,
-        buildComparisonFunction(item)
+        buildComparisonFunction(item),
       );
       expect(foundItem).to.not.exist;
     });

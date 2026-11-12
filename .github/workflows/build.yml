@@ -6,11 +6,21 @@ on:
     tags: ['v*']
   pull_request:
 
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
 jobs:
   config:
     runs-on: ubuntu-latest
+    concurrency:
+      group: 'build:config:${{ github.ref }}'
+      cancel-in-progress: true
     outputs:
       canUseSauce: ${{ steps.check_sauce_access.outputs.result == 'true' }}
+      canUseBrowserStack: ${{ steps.check_browserstack_access.outputs.result == 'true' }}
       tag: ${{ steps.extract_tag.outputs.result }}
       isMainBranch: ${{ github.ref == 'refs/heads/master' }}
     steps:
@@ -18,15 +28,25 @@ jobs:
         id: check_sauce_access
         run: |
           if ! [[ -z "$SAUCE_USERNAME" ]] && ! [[ -z "$SAUCE_ACCESS_KEY" ]]; then
-            echo "::set-output name=result::true"
+            echo "result=true" >> $GITHUB_OUTPUT
           fi
         env:
           CI: true
           SAUCE_USERNAME: ${{ secrets.SAUCE_USERNAME }}
           SAUCE_ACCESS_KEY: ${{ secrets.SAUCE_ACCESS_KEY }}
+      - name: check browserstack access
+        id: check_browserstack_access
+        run: |
+          if ! [[ -z "$BROWSERSTACK_USERNAME" ]] && ! [[ -z "$BROWSERSTACK_ACCESS_KEY" ]]; then
+            echo "result=true" >> $GITHUB_OUTPUT
+          fi
+        env:
+          CI: true
+          BROWSERSTACK_USERNAME: ${{ secrets.BROWSERSTACK_USERNAME }}
+          BROWSERSTACK_ACCESS_KEY: ${{ secrets.BROWSERSTACK_ACCESS_KEY }}
       - name: extract tag
         id: extract_tag
-        uses: actions/github-script@v3
+        uses: actions/github-script@v9
         with:
           script: |
             const prefix = 'refs/tags/';
@@ -37,14 +57,30 @@ jobs:
   build:
     needs: config
     runs-on: ubuntu-latest
-
+    concurrency:
+      group: 'build:build:${{ github.ref }}'
+      cancel-in-progress: true
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
+      - name: check package-lock.json version
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const fs = require('fs');
+            if (
+              JSON.parse(fs.readFileSync('./package-lock.json', { encoding: 'utf8' }))
+                .lockfileVersion !== 2
+            ) {
+              throw new Error(
+                'Expecting package-lock.json version to be 2. Please make sure you are using npm 7.'
+              );
+            }
+
       - name: cache node_modules
-        uses: actions/cache@v2
+        uses: actions/cache@v6
         env:
           cache-name: cache-node-modules
         with:
@@ -56,9 +92,9 @@ jobs:
             ${{ runner.os }}-
 
       - name: use Node.js
-        uses: actions/setup-node@v2
+        uses: actions/setup-node@v7
         with:
-          node-version: '12'
+          node-version-file: '.node-version'
 
       - name: install
         run: |
@@ -73,7 +109,7 @@ jobs:
 
       - name: set version
         run: |
-          node ./scripts/set-package-version.js
+          ./scripts/set-package-version.sh
         env:
           CI: true
           TAG: ${{ needs.config.outputs.tag }}
@@ -82,29 +118,42 @@ jobs:
         run: |
           npm run build:ci
           npm run docs
+          ./scripts/check-docs-built.sh
+
           # check that hls.js doesn't error if requiring in node
           # see https://github.com/video-dev/hls.js/pull/1642
           node -e 'require("./" + require("./package.json").main)'
         env:
           CI: true
 
+      - name: check bundle size
+        run: |
+          npm run size:check
+        env:
+          CI: true
+
       - name: upload build
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v4
         with:
           name: build
+          # version number is set in package.json so need to include that
           path: |
-            **
-            !**/[.]*/**
-            !**/node_modules/
+            package.json
+            package-lock.json
+            api-docs/**
+            dist/**
 
   test_unit:
     needs: build
     runs-on: ubuntu-latest
+    concurrency:
+      group: 'build:test_unit:${{ github.ref }}'
+      cancel-in-progress: true
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v7
 
       - name: cache node_modules
-        uses: actions/cache@v2
+        uses: actions/cache@v6
         env:
           cache-name: cache-node-modules
         with:
@@ -116,12 +165,12 @@ jobs:
             ${{ runner.os }}-
 
       - name: use Node.js
-        uses: actions/setup-node@v2
+        uses: actions/setup-node@v7
         with:
-          node-version: '12'
+          node-version-file: '.node-version'
 
       - name: download build
-        uses: actions/download-artifact@v2
+        uses: actions/download-artifact@v5
         with:
           name: build
 
@@ -137,15 +186,18 @@ jobs:
         env:
           CI: true
 
-  netlify:
+  cloudflare_pages:
     needs: [config, test_unit]
     if: needs.config.outputs.tag || needs.config.outputs.isMainBranch == 'true'
     runs-on: ubuntu-latest
+    concurrency:
+      group: 'build:cloudflare_pages:${{ github.ref }}'
+      cancel-in-progress: true
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v7
 
       - name: cache node_modules
-        uses: actions/cache@v2
+        uses: actions/cache@v6
         env:
           cache-name: cache-node-modules
         with:
@@ -157,12 +209,12 @@ jobs:
             ${{ runner.os }}-
 
       - name: use Node.js
-        uses: actions/setup-node@v2
+        uses: actions/setup-node@v7
         with:
-          node-version: '12'
+          node-version-file: '.node-version'
 
       - name: download build
-        uses: actions/download-artifact@v2
+        uses: actions/download-artifact@v5
         with:
           name: build
 
@@ -172,34 +224,60 @@ jobs:
         env:
           CI: true
 
-      - name: build netlify
+      - name: build for CloudFlare
         run: |
-          ./scripts/build-netlify.sh
+          ./scripts/build-cloudflare.sh
         env:
           CI: true
 
-      - name: deploy netlify
+      - name: deploy to CloudFlare
         run: |
-          ./scripts/deploy-netlify.sh
+          ./scripts/deploy-cloudflare.sh
         env:
           CI: true
           GITHUB_TOKEN: ${{ secrets.CI_GITHUB_TOKEN }}
-          NETLIFY_ACCESS_TOKEN: ${{ secrets.NETLIFY_ACCESS_TOKEN }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
 
-  release_github:
+  update_draft_release:
     needs: [config, test_unit]
     if: needs.config.outputs.tag
     runs-on: ubuntu-latest
+    concurrency:
+      group: 'build:update_draft_release:${{ github.ref }}'
+      cancel-in-progress: true
+    outputs:
+      upload_url: ${{ steps.draft_release.outputs.upload_url }}
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v2
+      - name: draft release notes
+        id: draft_release
+        uses: tjenkinson/release-drafter@349214e6b3b889d8b333c012cc61a1f1753baf40
+        with:
+          tag: ${{ needs.config.outputs.tag }}
+          name: ${{ needs.config.outputs.tag }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  release_github:
+    needs: [config, test_unit, update_draft_release]
+    if: needs.config.outputs.tag
+    runs-on: ubuntu-latest
+    concurrency:
+      group: 'build:release_github:${{ github.ref }}'
+      cancel-in-progress: true
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
 
       - name: use Node.js
-        uses: actions/setup-node@v2
+        uses: actions/setup-node@v7
         with:
-          node-version: '12'
+          node-version-file: '.node-version'
 
       - name: download build
-        uses: actions/download-artifact@v2
+        uses: actions/download-artifact@v5
         with:
           name: build
 
@@ -207,20 +285,10 @@ jobs:
         run: |
           zip -r dist.zip dist
 
-      - name: create github release
-        id: create_release
-        uses: actions/create-release@v1
-        with:
-          tag_name: ${{ github.ref }}
-          release_name: ${{ github.ref }}
-          draft: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
       - name: upload assets to github release
         uses: actions/upload-release-asset@v1
         with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          upload_url: ${{ needs.update_draft_release.outputs.upload_url }}
           asset_path: dist.zip
           asset_name: release.zip
           asset_content_type: application/zip
@@ -228,14 +296,22 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   release_npm:
+    # npm oidc is configured for this environment
+    # https://docs.npmjs.com/trusted-publishers#for-github-actions
+    environment: release
     needs: [config, test_unit]
     if: needs.config.outputs.tag || needs.config.outputs.isMainBranch == 'true'
     runs-on: ubuntu-latest
+    concurrency:
+      group: 'build:release_npm:${{ github.ref }}'
+      cancel-in-progress: true
+    permissions:
+      id-token: write
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v7
 
       - name: cache node_modules
-        uses: actions/cache@v2
+        uses: actions/cache@v6
         env:
           cache-name: cache-node-modules
         with:
@@ -247,12 +323,12 @@ jobs:
             ${{ runner.os }}-
 
       - name: use Node.js
-        uses: actions/setup-node@v2
+        uses: actions/setup-node@v7
         with:
-          node-version: '12'
+          node-version-file: '.node-version'
 
       - name: download build
-        uses: actions/download-artifact@v2
+        uses: actions/download-artifact@v5
         with:
           name: build
 
@@ -262,34 +338,43 @@ jobs:
         env:
           CI: true
 
+      # Publishing with OICD needs >= 11.5.1
+      - name: Update npm to v11
+        run: npm install -g npm@11
+
       - name: publish to npm
         run: |
           ./scripts/publish-npm.sh
         env:
           CI: true
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
           TAG: ${{ needs.config.outputs.tag }}
 
   test_functional_required:
     needs: [config, test_unit]
     if: needs.config.outputs.canUseSauce == 'true'
     runs-on: ubuntu-latest
+    concurrency:
+      group: 'build:test_functional_required:${{ matrix.config }}:${{ github.ref }}'
+      cancel-in-progress: true
+    name: test_functional_required (${{ matrix.config }})
     strategy:
       fail-fast: true
       max-parallel: 8
       matrix:
-        config: [chrome-win_10]
-
         include:
           - config: chrome-win_10
             ua: chrome
             os: Windows 10
+          - config: chrome-win_8-75.0
+            ua: chrome
+            os: Windows 8
+            uaVersion: '75.0'
 
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v7
 
       - name: cache node_modules
-        uses: actions/cache@v2
+        uses: actions/cache@v6
         env:
           cache-name: cache-node-modules
         with:
@@ -301,22 +386,24 @@ jobs:
             ${{ runner.os }}-
 
       - name: use Node.js
-        uses: actions/setup-node@v2
+        uses: actions/setup-node@v7
         with:
-          node-version: '12'
+          node-version-file: '.node-version'
 
       - name: download build
-        uses: actions/download-artifact@v2
+        uses: actions/download-artifact@v5
         with:
           name: build
 
       - name: start SauceConnect tunnel
-        uses: saucelabs/sauce-connect-action@5c0cf29805c7fe68f2dec68c6384332fb1ba73f9
+        uses: saucelabs/sauce-connect-action@cb88b508c6f9ff4d84490093733315dbd55de022 # v3
         with:
           username: ${{ secrets.SAUCE_USERNAME }}
           accessKey: ${{ secrets.SAUCE_ACCESS_KEY }}
-          tunnelIdentifier: ${{ github.run_id }}-${{ matrix.config }}
-          retryTimeout: 300
+          region: us-west-1
+          tunnelName: ${{ github.run_id }}-${{ matrix.config }}
+          retryTimeout: 5
+          proxyLocalhost: direct # sc4 was false
 
       - name: install
         run: |
@@ -338,49 +425,34 @@ jobs:
           OS: ${{ matrix.os }}
 
   test_functional_optional:
-    needs: test_functional_required
+    needs: [config, test_functional_required]
+    if: needs.config.outputs.canUseBrowserStack == 'true'
     runs-on: ubuntu-latest
+    concurrency:
+      group: 'build:test_functional_optional:${{ matrix.config }}:${{ github.ref }}'
+      cancel-in-progress: true
     continue-on-error: true
+    name: test_functional_optional (${{ matrix.config }})
     strategy:
       fail-fast: false
-      max-parallel: 8
+      max-parallel: 4
       matrix:
-        config:
-          - safari-osx_10.15
-          - firefox-win_10
-          - chrome-osx_10.11-79.0
-          - internet_explorer-win_10
-          - internet_explorer-win_8.1-11.0
-          - chrome-win_7-69.0
-
         include:
-          - config: safari-osx_10.15
+          - config: safari-macOS_15
             ua: safari
-            os: OS X 10.15
-          - config: firefox-win_10
+            os: macOS 15
+          - config: chrome-macOS_14
+            ua: chrome
+            os: macOS 14
+          - config: firefox-macOS_15
             ua: firefox
-            os: Windows 10
-          - config: chrome-osx_10.11-79.0
-            ua: chrome
-            os: OS X 10.11
-            uaVersion: '79.0'
-          - config: internet_explorer-win_10
-            ua: internet explorer
-            os: Windows 10
-          - config: internet_explorer-win_8.1-11.0
-            ua: internet explorer
-            os: Windows 8.1
-            uaVersion: '11.0'
-          - config: chrome-win_7-69.0
-            ua: chrome
-            os: Windows 7
-            uaVersion: '69.0'
+            os: macOS 15
 
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v7
 
       - name: cache node_modules
-        uses: actions/cache@v2
+        uses: actions/cache@v6
         env:
           cache-name: cache-node-modules
         with:
@@ -392,22 +464,26 @@ jobs:
             ${{ runner.os }}-
 
       - name: use Node.js
-        uses: actions/setup-node@v2
+        uses: actions/setup-node@v7
         with:
-          node-version: '12'
+          node-version-file: '.node-version'
 
       - name: download build
-        uses: actions/download-artifact@v2
+        uses: actions/download-artifact@v5
         with:
           name: build
 
-      - name: start SauceConnect tunnel
-        uses: saucelabs/sauce-connect-action@5c0cf29805c7fe68f2dec68c6384332fb1ba73f9
+      - name: setup BrowserStack env
+        uses: browserstack/github-actions/setup-env@93aebce225b754566349151c0676b26b005e591b # v1.0.4
         with:
-          username: ${{ secrets.SAUCE_USERNAME }}
-          accessKey: ${{ secrets.SAUCE_ACCESS_KEY }}
-          tunnelIdentifier: ${{ github.run_id }}-${{ matrix.config }}
-          retryTimeout: 300
+          username: ${{ secrets.BROWSERSTACK_USERNAME }}
+          access-key: ${{ secrets.BROWSERSTACK_ACCESS_KEY }}
+
+      - name: start BrowserStack Local
+        uses: browserstack/github-actions/setup-local@93aebce225b754566349151c0676b26b005e591b # v1.0.4
+        with:
+          local-testing: start
+          local-identifier: ${{ github.run_id }}-${{ matrix.config }}
 
       - name: install
         run: |
@@ -420,9 +496,17 @@ jobs:
           npm run test:func
         env:
           CI: true
-          SAUCE_TUNNEL_ID: ${{ github.run_id }}-${{ matrix.config }}
-          SAUCE_USERNAME: ${{ secrets.SAUCE_USERNAME }}
-          SAUCE_ACCESS_KEY: ${{ secrets.SAUCE_ACCESS_KEY }}
+          BROWSERSTACK: 1
+          BROWSERSTACK_USERNAME: ${{ secrets.BROWSERSTACK_USERNAME }}
+          BROWSERSTACK_ACCESS_KEY: ${{ secrets.BROWSERSTACK_ACCESS_KEY }}
+          BROWSERSTACK_LOCAL_IDENTIFIER: ${{ github.run_id }}-${{ matrix.config }}
+          BROWSERSTACK_BUILD_ID: ${{ github.run_id }}-${{ matrix.config }}
           UA: ${{ matrix.ua }}
           UA_VERSION: ${{ matrix.uaVersion }}
           OS: ${{ matrix.os }}
+
+      - name: stop BrowserStack Local
+        if: always()
+        uses: browserstack/github-actions/setup-local@93aebce225b754566349151c0676b26b005e591b # v1.0.4
+        with:
+          local-testing: stop

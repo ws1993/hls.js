@@ -1,16 +1,45 @@
 import { logger } from './logger';
+import { userAgentIsIOSLike } from './user-agent';
+import type { MediaPlaylist } from '../hls';
 
-export function sendAddTrackEvent(track: TextTrack, videoEl: HTMLMediaElement) {
-  let event: Event;
-  try {
-    event = new Event('addtrack');
-  } catch (err) {
-    // for IE11
-    event = document.createEvent('Event');
-    event.initEvent('addtrack', false, false);
+// This is a replacement of the native addTextTrack method.
+// TextTracks created by the native method are unremovable since their livecycles
+// are neither associated with the current media nor managed by user code.
+export function createTrackNode(
+  videoEl: HTMLMediaElement,
+  kind: TextTrackKind | 'forced',
+  label: string,
+  lang: string = '',
+  mode: TextTrackMode = 'disabled',
+): HTMLTrackElement {
+  const el = videoEl.ownerDocument.createElement('track');
+  el.kind = kind;
+  el.label = label;
+  if (lang) {
+    el.srclang = lang;
   }
-  (event as any).track = track;
-  videoEl.dispatchEvent(event);
+  // To avoid an issue of the built-in captions menu in Chrome
+  // https://github.com/video-dev/hls.js/issues/2198#issuecomment-761614248
+  // It also prevents Safari from removing cues after setting track.mode to `hidden` or `disabled`
+  // https://github.com/video-dev/hls.js/pull/7515#issuecomment-3251091932
+  el.src = 'data:,WEBVTT';
+  el.track.mode = mode;
+  videoEl.appendChild(el);
+  return el;
+}
+
+export function getTrackKind(track: MediaPlaylist): TextTrackKind | 'forced' {
+  if (track.forced && userAgentIsIOSLike()) {
+    return 'forced';
+  } else if (
+    track.characteristics &&
+    /transcribes-spoken-dialog/gi.test(track.characteristics) &&
+    /describes-music-and-sound/gi.test(track.characteristics)
+  ) {
+    return 'captions';
+  }
+
+  return 'subtitles';
 }
 
 export function addCueToTrack(track: TextTrack, cue: VTTCue) {
@@ -29,33 +58,20 @@ export function addCueToTrack(track: TextTrack, cue: VTTCue) {
       }
     } catch (err) {
       logger.debug(`[texttrack-utils]: ${err}`);
-      const textTrackCue = new (self.TextTrackCue as any)(
-        cue.startTime,
-        cue.endTime,
-        cue.text
-      );
-      textTrackCue.id = cue.id;
-      track.addCue(textTrackCue);
+      try {
+        const textTrackCue = new (self.TextTrackCue as any)(
+          cue.startTime,
+          cue.endTime,
+          cue.text,
+        );
+        textTrackCue.id = cue.id;
+        track.addCue(textTrackCue);
+      } catch (err2) {
+        logger.debug(
+          `[texttrack-utils]: Legacy TextTrackCue fallback failed: ${err2}`,
+        );
+      }
     }
-  }
-  if (mode === 'disabled') {
-    track.mode = mode;
-  }
-}
-
-export function clearCurrentCues(track: TextTrack) {
-  // When track.mode is disabled, track.cues will be null.
-  // To guarantee the removal of cues, we need to temporarily
-  // change the mode to hidden
-  const mode = track.mode;
-  if (mode === 'disabled') {
-    track.mode = 'hidden';
-  }
-  if (!track.cues) {
-    return;
-  }
-  for (let i = track.cues.length; i--; ) {
-    track.removeCue(track.cues[i]);
   }
   if (mode === 'disabled') {
     track.mode = mode;
@@ -65,32 +81,35 @@ export function clearCurrentCues(track: TextTrack) {
 export function removeCuesInRange(
   track: TextTrack,
   start: number,
-  end: number
+  end: number,
+  predicate?: (cue: TextTrackCue) => boolean,
 ) {
   const mode = track.mode;
   if (mode === 'disabled') {
     track.mode = 'hidden';
   }
-  if (!track.cues || !track.cues.length) {
-    return;
-  }
-  const cues = getCuesInRange(track.cues, start, end);
-  for (let i = 0; i < cues.length; i++) {
-    track.removeCue(cues[i]);
+
+  if (track.cues && track.cues.length > 0) {
+    const cues = getCuesInRange(track.cues, start, end);
+    for (let i = 0; i < cues.length; i++) {
+      if (!predicate || predicate(cues[i])) {
+        track.removeCue(cues[i]);
+      }
+    }
   }
   if (mode === 'disabled') {
     track.mode = mode;
   }
 }
 
-// Find first cue starting after given time.
+// Find first cue starting at or after given time.
 // Modified version of binary search O(log(n)).
-function getFirstCueIndexAfterTime(
+function getFirstCueIndexFromTime(
   cues: TextTrackCueList | TextTrackCue[],
-  time: number
+  time: number,
 ): number {
-  // If first cue starts after time, start there
-  if (time < cues[0].startTime) {
+  // If first cue starts at or after time, start there
+  if (time <= cues[0].startTime) {
     return 0;
   }
   // If the last cue ends before time there is no overlap
@@ -101,9 +120,9 @@ function getFirstCueIndexAfterTime(
 
   let left = 0;
   let right = len;
-
+  let mid;
   while (left <= right) {
-    const mid = Math.floor((right + left) / 2);
+    mid = Math.floor((right + left) / 2);
 
     if (time < cues[mid].startTime) {
       right = mid - 1;
@@ -124,10 +143,10 @@ function getFirstCueIndexAfterTime(
 export function getCuesInRange(
   cues: TextTrackCueList | TextTrackCue[],
   start: number,
-  end: number
+  end: number,
 ): TextTrackCue[] {
   const cuesFound: TextTrackCue[] = [];
-  const firstCueInRange = getFirstCueIndexAfterTime(cues, start);
+  const firstCueInRange = getFirstCueIndexFromTime(cues, start);
   if (firstCueInRange > -1) {
     for (let i = firstCueInRange, len = cues.length; i < len; i++) {
       const cue = cues[i];

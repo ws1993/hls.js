@@ -2,17 +2,18 @@
  * SAMPLE-AES decrypter
  */
 
-import { HlsConfig } from '../config';
 import Decrypter from '../crypt/decrypter';
-import { HlsEventEmitter } from '../events';
+import { DecrypterAesMode } from '../crypt/decrypter-aes-mode';
+import { discardEPB } from '../utils/mp4-tools';
+import type { HlsConfig } from '../config';
+import type { HlsEventEmitter } from '../events';
 import type {
-  AudioSample,
-  AvcSample,
-  AvcSampleUnit,
-  DemuxedVideoTrack,
+  AACAudioSample,
+  DemuxedVideoTrackBase,
   KeyData,
+  VideoSample,
+  VideoSampleUnit,
 } from '../types/demuxer';
-import { discardEPB } from './tsdemuxer';
 
 class SampleAesDecrypter {
   private keyData: KeyData;
@@ -20,55 +21,57 @@ class SampleAesDecrypter {
 
   constructor(observer: HlsEventEmitter, config: HlsConfig, keyData: KeyData) {
     this.keyData = keyData;
-    this.decrypter = new Decrypter(observer, config, {
-      removePKCS7Padding: false,
-    });
+    this.decrypter = new Decrypter(config, true);
   }
 
-  decryptBuffer(
-    encryptedData: Uint8Array | ArrayBuffer,
-    callback: (decryptedData: ArrayBuffer) => void
-  ) {
-    this.decrypter.decrypt(
+  decryptBuffer(encryptedData: Uint8Array | ArrayBuffer): Promise<ArrayBuffer> {
+    return this.decrypter.decrypt(
       encryptedData,
       this.keyData.key.buffer,
       this.keyData.iv.buffer,
-      callback
+      DecrypterAesMode.cbc,
+      // SAMPLE-AES blocks are not PKCS7 padded. Pass range to prevent padding removal.
+      { start: 0, end: encryptedData.byteLength },
     );
   }
 
   // AAC - encrypt all full 16 bytes blocks starting from offset 16
   private decryptAacSample(
-    samples: AudioSample[],
+    samples: AACAudioSample[],
     sampleIndex: number,
     callback: () => void,
-    sync: boolean
   ) {
     const curUnit = samples[sampleIndex].unit;
+    if (curUnit.length <= 16) {
+      // No encrypted portion in this sample (first 16 bytes is not
+      // encrypted, see https://developer.apple.com/library/archive/documentation/AudioVideo/Conceptual/HLS_Sample_Encryption/Encryption/Encryption.html),
+      return;
+    }
     const encryptedData = curUnit.subarray(
       16,
-      curUnit.length - (curUnit.length % 16)
+      curUnit.length - (curUnit.length % 16),
     );
     const encryptedBuffer = encryptedData.buffer.slice(
       encryptedData.byteOffset,
-      encryptedData.byteOffset + encryptedData.length
+      encryptedData.byteOffset + encryptedData.length,
     );
 
-    const localthis = this;
-    this.decryptBuffer(encryptedBuffer, (decryptedBuffer: ArrayBuffer) => {
-      const decryptedData = new Uint8Array(decryptedBuffer);
-      curUnit.set(decryptedData, 16);
+    this.decryptBuffer(encryptedBuffer)
+      .then((decryptedBuffer: ArrayBuffer) => {
+        const decryptedData = new Uint8Array(decryptedBuffer);
+        curUnit.set(decryptedData, 16);
 
-      if (!sync) {
-        localthis.decryptAacSamples(samples, sampleIndex + 1, callback);
-      }
-    });
+        if (!this.decrypter.isSync()) {
+          this.decryptAacSamples(samples, sampleIndex + 1, callback);
+        }
+      })
+      .catch(callback);
   }
 
   decryptAacSamples(
-    samples: AudioSample[],
+    samples: AACAudioSample[],
     sampleIndex: number,
-    callback: () => void
+    callback: () => void,
   ) {
     for (; ; sampleIndex++) {
       if (sampleIndex >= samples.length) {
@@ -80,11 +83,9 @@ class SampleAesDecrypter {
         continue;
       }
 
-      const sync = this.decrypter.isSync();
+      this.decryptAacSample(samples, sampleIndex, callback);
 
-      this.decryptAacSample(samples, sampleIndex, callback, sync);
-
-      if (!sync) {
+      if (!this.decrypter.isSync()) {
         return;
       }
     }
@@ -98,32 +99,29 @@ class SampleAesDecrypter {
     let outputPos = 0;
     for (
       let inputPos = 32;
-      inputPos <= decodedData.length - 16;
+      inputPos < decodedData.length - 16;
       inputPos += 160, outputPos += 16
     ) {
       encryptedData.set(
         decodedData.subarray(inputPos, inputPos + 16),
-        outputPos
+        outputPos,
       );
     }
 
     return encryptedData;
   }
 
-  getAvcDecryptedUnit(
-    decodedData: Uint8Array,
-    decryptedData: ArrayLike<number> | ArrayBuffer | SharedArrayBuffer
-  ) {
+  getAvcDecryptedUnit(decodedData: Uint8Array, decryptedData: ArrayBufferLike) {
     const uint8DecryptedData = new Uint8Array(decryptedData);
     let inputPos = 0;
     for (
       let outputPos = 32;
-      outputPos <= decodedData.length - 16;
+      outputPos < decodedData.length - 16;
       outputPos += 160, inputPos += 16
     ) {
       decodedData.set(
         uint8DecryptedData.subarray(inputPos, inputPos + 16),
-        outputPos
+        outputPos,
       );
     }
 
@@ -131,42 +129,31 @@ class SampleAesDecrypter {
   }
 
   decryptAvcSample(
-    samples: AvcSample[],
+    samples: VideoSample[],
     sampleIndex: number,
     unitIndex: number,
     callback: () => void,
-    curUnit: AvcSampleUnit,
-    sync: boolean
+    curUnit: VideoSampleUnit,
   ) {
     const decodedData = discardEPB(curUnit.data);
     const encryptedData = this.getAvcEncryptedData(decodedData);
-    const localthis = this;
 
-    this.decryptBuffer(
-      encryptedData.buffer,
-      function (decryptedBuffer: ArrayBuffer) {
-        curUnit.data = localthis.getAvcDecryptedUnit(
-          decodedData,
-          decryptedBuffer
-        );
+    this.decryptBuffer(encryptedData.buffer)
+      .then((decryptedBuffer) => {
+        curUnit.data = this.getAvcDecryptedUnit(decodedData, decryptedBuffer);
 
-        if (!sync) {
-          localthis.decryptAvcSamples(
-            samples,
-            sampleIndex,
-            unitIndex + 1,
-            callback
-          );
+        if (!this.decrypter.isSync()) {
+          this.decryptAvcSamples(samples, sampleIndex, unitIndex + 1, callback);
         }
-      }
-    );
+      })
+      .catch(callback);
   }
 
   decryptAvcSamples(
-    samples: DemuxedVideoTrack['samples'],
+    samples: DemuxedVideoTrackBase['samples'],
     sampleIndex: number,
     unitIndex: number,
-    callback: () => void
+    callback: () => void,
   ) {
     if (samples instanceof Uint8Array) {
       throw new Error('Cannot decrypt samples of type Uint8Array');
@@ -192,18 +179,15 @@ class SampleAesDecrypter {
           continue;
         }
 
-        const sync = this.decrypter.isSync();
-
         this.decryptAvcSample(
           samples,
           sampleIndex,
           unitIndex,
           callback,
           curUnit,
-          sync
         );
 
-        if (!sync) {
+        if (!this.decrypter.isSync()) {
           return;
         }
       }

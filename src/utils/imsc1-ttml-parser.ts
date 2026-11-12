@@ -1,9 +1,10 @@
+import { utf8ArrayToStr } from '@svta/cml-id3';
 import { findBox } from './mp4-tools';
-import { parseTimeStamp } from './vttparser';
-import VTTCue from './vttcue';
-import { utf8ArrayToStr } from '../demux/id3';
 import { toTimescaleFromScale } from './timescale-conversion';
+import VTTCue from './vttcue';
+import { parseTimeStamp } from './vttparser';
 import { generateCueId } from './webvtt-parser';
+import type { TimestampOffset } from './timescale-conversion';
 
 export const IMSC1_CODEC = 'stpp.ttml.im1t';
 
@@ -13,26 +14,32 @@ const HMSF_REGEX = /^(\d{2,}):(\d{2}):(\d{2}):(\d{2})\.?(\d+)?$/;
 // Time format: hours, minutes, seconds, milliseconds, frames, ticks
 const TIME_UNIT_REGEX = /^(\d*(?:\.\d*)?)(h|m|s|ms|f|t)$/;
 
+const textAlignToLineAlign: Partial<Record<string, LineAlignSetting>> = {
+  left: 'start',
+  center: 'center',
+  right: 'end',
+  start: 'start',
+  end: 'end',
+};
+
 export function parseIMSC1(
   payload: ArrayBuffer,
-  initPTS: number,
-  timescale: number,
+  initPTS: TimestampOffset,
   callBack: (cues: Array<VTTCue>) => any,
-  errorCallBack: (error: Error) => any
+  errorCallBack: (error: Error) => any,
 ) {
   const results = findBox(new Uint8Array(payload), ['mdat']);
   if (results.length === 0) {
     errorCallBack(new Error('Could not parse IMSC1 mdat'));
     return;
   }
-  const mdat = results[0];
-  const ttml = utf8ArrayToStr(
-    new Uint8Array(payload, mdat.start, mdat.end - mdat.start)
-  );
-  const syncTime = toTimescaleFromScale(initPTS, 1, timescale);
+
+  const ttmlList = results.map((mdat) => utf8ArrayToStr(mdat));
+
+  const syncTime = toTimescaleFromScale(initPTS.baseTime, 1, initPTS.timescale);
 
   try {
-    callBack(parseTTML(ttml, syncTime));
+    ttmlList.forEach((ttml) => callBack(parseTTML(ttml, syncTime)));
   } catch (error) {
     errorCallBack(error);
   }
@@ -48,24 +55,41 @@ function parseTTML(ttml: string, syncTime: number): Array<VTTCue> {
   const defaultRateInfo = {
     frameRate: 30,
     subFrameRate: 1,
-    frameRateMultiplier: 0,
-    tickRate: 0,
+    tickRate: 1,
   };
-  const rateInfo: Object = Object.keys(defaultRateInfo).reduce(
-    (result, key) => {
-      result[key] = tt.getAttribute(`ttp:${key}`) || defaultRateInfo[key];
-      return result;
-    },
-    {}
-  );
+  const rateInfo: Record<string, string | number> = Object.keys(
+    defaultRateInfo,
+  ).reduce((result, key) => {
+    result[key] = tt.getAttribute(`ttp:${key}`) || defaultRateInfo[key];
+    return result;
+  }, {});
+  // TTML1 6.2.5: frames are counted at the effective frame rate, which is
+  // ttp:frameRate times the ttp:frameRateMultiplier ratio (1:1 if absent).
+  const multiplier = (tt.getAttribute('ttp:frameRateMultiplier') || '')
+    .trim()
+    .split(/\s+/)
+    .map(Number);
+  if (multiplier.length === 2 && multiplier[0] > 0 && multiplier[1] > 0) {
+    rateInfo.frameRate =
+      (Number(rateInfo.frameRate) * multiplier[0]) / multiplier[1];
+  }
+  // TTML1 6.2.10: with no ttp:tickRate, a document that declares a frame rate
+  // counts ticks as sub-frames, and one without counts a tick as a second.
+  // Only the second case can fall back to the default above, so the first is
+  // derived here, and it needs to know whether ttp:frameRate was really
+  // present rather than filled in from defaultRateInfo.
+  if (!tt.getAttribute('ttp:tickRate') && tt.getAttribute('ttp:frameRate')) {
+    rateInfo.tickRate =
+      Number(rateInfo.frameRate) * Number(rateInfo.subFrameRate);
+  }
 
   const trim = tt.getAttribute('xml:space') !== 'preserve';
 
   const styleElements = collectionToDictionary(
-    getElementCollection(tt, 'styling', 'style')
+    getElementCollection(tt, 'styling', 'style'),
   );
   const regionElements = collectionToDictionary(
-    getElementCollection(tt, 'layout', 'region')
+    getElementCollection(tt, 'layout', 'region'),
   );
   const cueElements = getElementCollection(tt, 'body', '[begin]');
 
@@ -78,7 +102,7 @@ function parseTTML(ttml: string, syncTime: number): Array<VTTCue> {
       }
       const startTime = parseTtmlTime(
         cueElement.getAttribute('begin'),
-        rateInfo
+        rateInfo,
       );
       const duration = parseTtmlTime(cueElement.getAttribute('dur'), rateInfo);
       let endTime = parseTtmlTime(cueElement.getAttribute('end'), rateInfo);
@@ -97,23 +121,15 @@ function parseTTML(ttml: string, syncTime: number): Array<VTTCue> {
       const region = regionElements[cueElement.getAttribute('region')];
       const style = styleElements[cueElement.getAttribute('style')];
 
-      // TODO: Add regions to track and cue (origin and extend)
-      // These values are hard-coded (for now) to simulate region settings in the demo
-      cue.position = 10;
-      cue.size = 80;
-
       // Apply styles to cue
-      const styles = getTtmlStyles(region, style);
+      const styles = getTtmlStyles(region, style, styleElements);
       const { textAlign } = styles;
       if (textAlign) {
         // cue.positionAlign not settable in FF~2016
-        cue.lineAlign = {
-          left: 'start',
-          center: 'center',
-          right: 'end',
-          start: 'start',
-          end: 'end',
-        }[textAlign];
+        const lineAlign = textAlignToLineAlign[textAlign];
+        if (lineAlign) {
+          cue.lineAlign = lineAlign;
+        }
         cue.align = textAlign as AlignSetting;
       }
       Object.assign(cue, styles);
@@ -126,7 +142,7 @@ function parseTTML(ttml: string, syncTime: number): Array<VTTCue> {
 function getElementCollection(
   fromElement,
   parentName,
-  childName
+  childName,
 ): Array<HTMLElement> {
   const parent = fromElement.getElementsByTagName(parentName)[0];
   if (parent) {
@@ -135,9 +151,9 @@ function getElementCollection(
   return [];
 }
 
-function collectionToDictionary(
-  elementsWithId: Array<HTMLElement>
-): { [id: string]: HTMLElement } {
+function collectionToDictionary(elementsWithId: Array<HTMLElement>): {
+  [id: string]: HTMLElement;
+} {
   return elementsWithId.reduce((dict, element: HTMLElement) => {
     const id = element.getAttribute('xml:id');
     if (id) {
@@ -148,21 +164,39 @@ function collectionToDictionary(
 }
 
 function getTextContent(element, trim): string {
+  const text = collectText(element, trim);
+  if (!trim) {
+    return text;
+  }
+  // TTML1 7.2.3, xml:space="default": a run of white space across elements is
+  // a single space, and none is kept at the start or end of a line.
+  return text
+    .split('\n')
+    .map((line) => line.replace(/ {2,}/g, ' ').trim())
+    .join('\n');
+}
+
+function collectText(element, trim): string {
   return [].slice.call(element.childNodes).reduce((str, node, i) => {
     if (node.nodeName === 'br' && i) {
       return str + '\n';
     }
     if (node.childNodes?.length) {
-      return getTextContent(node, trim);
-    } else if (trim) {
-      return str + node.textContent.trim().replace(/\s+/g, ' ');
+      return str + collectText(node, trim);
     }
-    return str + node.textContent;
+    return (
+      str + (trim ? node.textContent.replace(/\s+/g, ' ') : node.textContent)
+    );
   }, '');
 }
 
-function getTtmlStyles(region, style): { [style: string]: string } {
+function getTtmlStyles(
+  region,
+  style,
+  styleElements,
+): { [style: string]: string } {
   const ttsNs = 'http://www.w3.org/ns/ttml#styling';
+  let regionStyle = null;
   const styleAttributes = [
     'displayAlign',
     'textAlign',
@@ -177,9 +211,20 @@ function getTtmlStyles(region, style): { [style: string]: string } {
     // 'direction',
     // 'writingMode'
   ];
+
+  const regionStyleName = region?.hasAttribute('style')
+    ? region.getAttribute('style')
+    : null;
+
+  if (regionStyleName && styleElements.hasOwnProperty(regionStyleName)) {
+    regionStyle = styleElements[regionStyleName];
+  }
+
   return styleAttributes.reduce((styles, name) => {
     const value =
-      getAttributeNS(style, ttsNs, name) || getAttributeNS(region, ttsNs, name);
+      getAttributeNS(style, ttsNs, name) ||
+      getAttributeNS(region, ttsNs, name) ||
+      getAttributeNS(regionStyle, ttsNs, name);
     if (value) {
       styles[name] = value;
     }
@@ -188,6 +233,9 @@ function getTtmlStyles(region, style): { [style: string]: string } {
 }
 
 function getAttributeNS(element, ns, name): string | null {
+  if (!element) {
+    return null;
+  }
   return element.hasAttributeNS(ns, name)
     ? element.getAttributeNS(ns, name)
     : null;
@@ -201,13 +249,14 @@ function parseTtmlTime(timeAttributeValue, rateInfo): number | null {
   if (!timeAttributeValue) {
     return null;
   }
+  // Check for frames first: parseTimeStamp reads the leading hh:mm:ss of
+  // hh:mm:ss:ff and drops the frames.
+  if (HMSF_REGEX.test(timeAttributeValue)) {
+    return parseHoursMinutesSecondsFrames(timeAttributeValue, rateInfo);
+  }
   let seconds: number | null = parseTimeStamp(timeAttributeValue);
-  if (seconds === null) {
-    if (HMSF_REGEX.test(timeAttributeValue)) {
-      seconds = parseHoursMinutesSecondsFrames(timeAttributeValue, rateInfo);
-    } else if (TIME_UNIT_REGEX.test(timeAttributeValue)) {
-      seconds = parseTimeUnits(timeAttributeValue, rateInfo);
-    }
+  if (seconds === null && TIME_UNIT_REGEX.test(timeAttributeValue)) {
+    seconds = parseTimeUnits(timeAttributeValue, rateInfo);
   }
   return seconds;
 }
@@ -233,7 +282,7 @@ function parseTimeUnits(timeAttributeValue, rateInfo): number {
     case 'm':
       return value * 60;
     case 'ms':
-      return value * 1000;
+      return value / 1000;
     case 'f':
       return value / rateInfo.frameRate;
     case 't':

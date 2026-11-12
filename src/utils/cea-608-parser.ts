@@ -1,5 +1,6 @@
-import OutputFilter from './output-filter';
+import { stringify } from './safe-json-stringify';
 import { logger } from '../utils/logger';
+import type OutputFilter from './output-filter';
 
 /**
  *
@@ -145,17 +146,11 @@ const specialCea608CharsCodes = {
 /**
  * Utils
  */
-const getCharForByte = function (byte: number) {
-  let charCode = byte;
-  if (specialCea608CharsCodes.hasOwnProperty(byte)) {
-    charCode = specialCea608CharsCodes[byte];
-  }
-
-  return String.fromCharCode(charCode);
-};
+const getCharForByte = (byte: number) =>
+  String.fromCharCode(specialCea608CharsCodes[byte] || byte);
 
 const NR_ROWS = 15;
-const NR_COLS = 100;
+const NR_COLS = 42;
 // Tables to look up row from PAC data
 const rowsLowCh1 = {
   0x11: 1,
@@ -208,7 +203,7 @@ const backgroundColors = [
   'transparent',
 ];
 
-enum VerboseLevel {
+const enum VerboseLevel {
   ERROR = 0,
   TEXT = 1,
   WARNING = 2,
@@ -221,9 +216,10 @@ class CaptionsLogger {
   public time: number | null = null;
   public verboseLevel: VerboseLevel = VerboseLevel.ERROR;
 
-  log(severity: VerboseLevel, msg: string): void {
+  log(severity: VerboseLevel, msg: string | (() => string)): void {
     if (this.verboseLevel >= severity) {
-      logger.log(`${this.time} [${severity}] ${msg}`);
+      const m: string = typeof msg === 'function' ? msg() : msg;
+      logger.log(`${this.time} [${severity}] ${m}`);
     }
   }
 }
@@ -245,77 +241,116 @@ type PenStyles = {
   flash: boolean;
 };
 
-class PenState {
-  public foreground: string;
-  public underline: boolean;
-  public italics: boolean;
-  public background: string;
-  public flash: boolean;
+const DEFAULT_PEN_STYLES: Readonly<PenStyles> = Object.freeze({
+  foreground: 'white',
+  underline: false,
+  italics: false,
+  background: 'black',
+  flash: false,
+});
 
-  constructor(
-    foreground?: string,
-    underline?: boolean,
-    italics?: boolean,
-    background?: string,
-    flash?: boolean
-  ) {
-    this.foreground = foreground || 'white';
-    this.underline = underline || false;
-    this.italics = italics || false;
-    this.background = background || 'black';
-    this.flash = flash || false;
+class PenState {
+  styles: Readonly<PenStyles> = DEFAULT_PEN_STYLES;
+
+  get foreground(): string | null {
+    return this.styles.foreground;
+  }
+
+  set foreground(foreground: string | null) {
+    const styles = this.styles;
+    this.styles = {
+      foreground,
+      underline: styles.underline,
+      italics: styles.italics,
+      background: styles.background,
+      flash: styles.flash,
+    };
+  }
+
+  get underline(): boolean {
+    return this.styles.underline;
+  }
+
+  set underline(underline: boolean) {
+    const styles = this.styles;
+    this.styles = {
+      foreground: styles.foreground,
+      underline,
+      italics: styles.italics,
+      background: styles.background,
+      flash: styles.flash,
+    };
+  }
+
+  get italics(): boolean {
+    return this.styles.italics;
+  }
+
+  set italics(italics: boolean) {
+    const styles = this.styles;
+    this.styles = {
+      foreground: styles.foreground,
+      underline: styles.underline,
+      italics,
+      background: styles.background,
+      flash: styles.flash,
+    };
+  }
+
+  get background(): string {
+    return this.styles.background;
+  }
+
+  set background(background: string) {
+    const styles = this.styles;
+    this.styles = {
+      foreground: styles.foreground,
+      underline: styles.underline,
+      italics: styles.italics,
+      background,
+      flash: styles.flash,
+    };
+  }
+
+  get flash(): boolean {
+    return this.styles.flash;
+  }
+
+  set flash(flash: boolean) {
+    const styles = this.styles;
+    this.styles = {
+      foreground: styles.foreground,
+      underline: styles.underline,
+      italics: styles.italics,
+      background: styles.background,
+      flash,
+    };
   }
 
   reset() {
-    this.foreground = 'white';
-    this.underline = false;
-    this.italics = false;
-    this.background = 'black';
-    this.flash = false;
+    this.styles = DEFAULT_PEN_STYLES;
   }
 
   setStyles(styles: Partial<PenStyles>) {
-    const attribs = [
-      'foreground',
-      'underline',
-      'italics',
-      'background',
-      'flash',
-    ];
-    for (let i = 0; i < attribs.length; i++) {
-      const style = attribs[i];
-      if (styles.hasOwnProperty(style)) {
-        this[style] = styles[style];
-      }
-    }
-  }
-
-  isDefault() {
-    return (
-      this.foreground === 'white' &&
-      !this.underline &&
-      !this.italics &&
-      this.background === 'black' &&
-      !this.flash
-    );
-  }
-
-  equals(other: PenState) {
-    return (
-      this.foreground === other.foreground &&
-      this.underline === other.underline &&
-      this.italics === other.italics &&
-      this.background === other.background &&
-      this.flash === other.flash
-    );
-  }
-
-  copy(newPenState: PenState) {
-    this.foreground = newPenState.foreground;
-    this.underline = newPenState.underline;
-    this.italics = newPenState.italics;
-    this.background = newPenState.background;
-    this.flash = newPenState.flash;
+    const currentStyles = this.styles;
+    const hasOwnProperty = Object.prototype.hasOwnProperty;
+    this.styles = {
+      foreground: hasOwnProperty.call(styles, 'foreground')
+        ? styles.foreground!
+        : currentStyles.foreground,
+      underline: hasOwnProperty.call(styles, 'underline')
+        ? styles.underline!
+        : currentStyles.underline,
+      italics: hasOwnProperty.call(styles, 'italics')
+        ? styles.italics!
+        : currentStyles.italics,
+      background: hasOwnProperty.call(styles, 'background')
+        ? styles.background!
+        : currentStyles.background,
+      flash: hasOwnProperty.call(styles, 'flash')
+        ? styles.flash!
+        : currentStyles.flash,
+    };
   }
 
   toString(): string {
@@ -339,26 +374,8 @@ class PenState {
  * @constructor
  */
 class StyledUnicodeChar {
-  uchar: string;
-  penState: PenState;
-
-  constructor(
-    uchar?: string,
-    foreground?: string,
-    underline?: boolean,
-    italics?: boolean,
-    background?: string,
-    flash?: boolean
-  ) {
-    this.uchar = uchar || ' '; // unicode character
-    this.penState = new PenState(
-      foreground,
-      underline,
-      italics,
-      background,
-      flash
-    );
-  }
+  uchar: string = ' ';
+  penState: PenState = new PenState();
 
   reset() {
     this.uchar = ' ';
@@ -367,24 +384,16 @@ class StyledUnicodeChar {
 
   setChar(uchar: string, newPenState: PenState) {
     this.uchar = uchar;
-    this.penState.copy(newPenState);
+    this.penState.styles = newPenState.styles;
   }
 
   setPenState(newPenState: PenState) {
-    this.penState.copy(newPenState);
-  }
-
-  equals(other: StyledUnicodeChar) {
-    return this.uchar === other.uchar && this.penState.equals(other.penState);
+    this.penState.styles = newPenState.styles;
   }
 
   copy(newChar: StyledUnicodeChar) {
     this.uchar = newChar.uchar;
-    this.penState.copy(newChar.penState);
-  }
-
-  isEmpty(): boolean {
-    return this.uchar === ' ' && this.penState.isDefault();
+    this.penState.styles = newChar.penState.styles;
   }
 }
 
@@ -393,32 +402,42 @@ class StyledUnicodeChar {
  * @constructor
  */
 export class Row {
-  public chars: StyledUnicodeChar[];
-  public pos: number;
-  public currPenState: PenState;
-  public cueStartTime?: number;
-  logger: CaptionsLogger;
+  public chars: StyledUnicodeChar[] = [];
+  public pos: number = 0;
+  public currPenState: PenState = new PenState();
+  public cueStartTime: number | null = null;
+  private logger: CaptionsLogger;
 
   constructor(logger: CaptionsLogger) {
-    this.chars = [];
     for (let i = 0; i < NR_COLS; i++) {
       this.chars.push(new StyledUnicodeChar());
     }
-
     this.logger = logger;
-    this.pos = 0;
-    this.currPenState = new PenState();
   }
 
   equals(other: Row) {
-    let equal = true;
+    const chars = this.chars;
+    const otherChars = other.chars;
     for (let i = 0; i < NR_COLS; i++) {
-      if (!this.chars[i].equals(other.chars[i])) {
-        equal = false;
-        break;
+      const char = chars[i];
+      const otherChar = otherChars[i];
+      if (char.uchar !== otherChar.uchar) {
+        return false;
+      }
+      const styles = char.penState.styles;
+      const otherStyles = otherChar.penState.styles;
+      if (
+        styles !== otherStyles &&
+        (styles.foreground !== otherStyles.foreground ||
+          styles.underline !== otherStyles.underline ||
+          styles.italics !== otherStyles.italics ||
+          styles.background !== otherStyles.background ||
+          styles.flash !== otherStyles.flash)
+      ) {
+        return false;
       }
     }
-    return equal;
+    return true;
   }
 
   copy(other: Row) {
@@ -428,14 +447,25 @@ export class Row {
   }
 
   isEmpty(): boolean {
-    let empty = true;
+    const chars = this.chars;
     for (let i = 0; i < NR_COLS; i++) {
-      if (!this.chars[i].isEmpty()) {
-        empty = false;
-        break;
+      const char = chars[i];
+      if (char.uchar !== ' ') {
+        return false;
+      }
+      const styles = char.penState.styles;
+      if (
+        styles !== DEFAULT_PEN_STYLES &&
+        (styles.foreground !== 'white' ||
+          styles.underline ||
+          styles.italics ||
+          styles.background !== 'black' ||
+          styles.flash)
+      ) {
+        return false;
       }
     }
-    return empty;
+    return true;
   }
 
   /**
@@ -449,15 +479,15 @@ export class Row {
     if (this.pos < 0) {
       this.logger.log(
         VerboseLevel.DEBUG,
-        'Negative cursor position ' + this.pos
+        'Negative cursor position ' + this.pos,
       );
       this.pos = 0;
-    } else if (this.pos > NR_COLS) {
+    } else if (this.pos >= NR_COLS) {
       this.logger.log(
         VerboseLevel.DEBUG,
-        'Too large cursor position ' + this.pos
+        'Too large cursor position ' + this.pos,
       );
-      this.pos = NR_COLS;
+      this.pos = NR_COLS - 1;
     }
   }
 
@@ -465,9 +495,9 @@ export class Row {
    * Move the cursor relative to current position.
    */
   moveCursor(relPos: number) {
-    const newPos = this.pos + relPos;
+    const newPos = Math.min(this.pos + relPos, NR_COLS);
     if (relPos > 1) {
-      for (let i = this.pos + 1; i < newPos + 1; i++) {
+      for (let i = this.pos + 1; i < newPos; i++) {
         this.chars[i].setPenState(this.currPenState);
       }
     }
@@ -491,13 +521,14 @@ export class Row {
     if (this.pos >= NR_COLS) {
       this.logger.log(
         VerboseLevel.ERROR,
-        'Cannot insert ' +
+        () =>
+          'Cannot insert ' +
           byte.toString(16) +
           ' (' +
           char +
           ') at position ' +
           this.pos +
-          '. Skipping it!'
+          '. Skipping it!',
       );
       return;
     }
@@ -552,30 +583,23 @@ export class Row {
  * @constructor
  */
 export class CaptionScreen {
-  rows: Row[];
-  currRow: number;
-  nrRollUpRows: number | null;
-  lastOutputScreen: CaptionScreen | null;
+  rows: Row[] = [];
+  currRow: number = NR_ROWS - 1;
+  nrRollUpRows: number | null = null;
+  lastOutputScreen: CaptionScreen | null = null;
   logger: CaptionsLogger;
 
   constructor(logger: CaptionsLogger) {
-    this.rows = [];
     for (let i = 0; i < NR_ROWS; i++) {
       this.rows.push(new Row(logger));
-    } // Note that we use zero-based numbering (0-14)
-
+    }
     this.logger = logger;
-    this.currRow = NR_ROWS - 1;
-    this.nrRollUpRows = null;
-    this.lastOutputScreen = null;
-    this.reset();
   }
 
   reset() {
     for (let i = 0; i < NR_ROWS; i++) {
       this.rows[i].clear();
     }
-
     this.currRow = NR_ROWS - 1;
   }
 
@@ -592,7 +616,14 @@ export class CaptionScreen {
 
   copy(other: CaptionScreen) {
     for (let i = 0; i < NR_ROWS; i++) {
-      this.rows[i].copy(other.rows[i]);
+      const chars = this.rows[i].chars;
+      const otherChars = other.rows[i].chars;
+      for (let j = 0; j < NR_COLS; j++) {
+        const char = chars[j];
+        const otherChar = otherChars[j];
+        char.uchar = otherChar.uchar;
+        char.penState.styles = otherChar.penState.styles;
+      }
     }
   }
 
@@ -642,7 +673,7 @@ export class CaptionScreen {
   }
 
   setPAC(pacData: PACData) {
-    this.logger.log(VerboseLevel.INFO, 'pacData = ' + JSON.stringify(pacData));
+    this.logger.log(VerboseLevel.INFO, () => 'pacData = ' + stringify(pacData));
     let newRow = pacData.row - 1;
     if (this.nrRollUpRows && newRow < this.nrRollUpRows - 1) {
       newRow = this.nrRollUpRows - 1;
@@ -664,10 +695,10 @@ export class CaptionScreen {
       if (lastOutputScreen) {
         const prevLineTime = lastOutputScreen.rows[topRowIndex].cueStartTime;
         const time = this.logger.time;
-        if (prevLineTime && time !== null && prevLineTime < time) {
+        if (prevLineTime !== null && time !== null && prevLineTime < time) {
           for (let i = 0; i < this.nrRollUpRows; i++) {
             this.rows[newRow - this.nrRollUpRows + i + 1].copy(
-              lastOutputScreen.rows[topRowIndex + i]
+              lastOutputScreen.rows[topRowIndex + i],
             );
           }
         }
@@ -696,7 +727,7 @@ export class CaptionScreen {
    * Set background/extra foreground, but first do back_space, and then insert space (backwards compatibility).
    */
   setBkgData(bkgData: Partial<PenStyles>) {
-    this.logger.log(VerboseLevel.INFO, 'bkgData = ' + JSON.stringify(bkgData));
+    this.logger.log(VerboseLevel.INFO, () => 'bkgData = ' + stringify(bkgData));
     this.backSpace();
     this.setPen(bkgData);
     this.insertChar(0x20); // Space
@@ -710,11 +741,11 @@ export class CaptionScreen {
     if (this.nrRollUpRows === null) {
       this.logger.log(
         VerboseLevel.DEBUG,
-        'roll_up but nrRollUpRows not set yet'
+        'roll_up but nrRollUpRows not set yet',
       );
       return; // Not properly setup
     }
-    this.logger.log(VerboseLevel.TEXT, this.getDisplayText());
+    this.logger.log(VerboseLevel.TEXT, () => this.getDisplayText());
     const topRowIndex = this.currRow + 1 - this.nrRollUpRows;
     const topRow = this.rows.splice(topRowIndex, 1)[0];
     topRow.clear();
@@ -782,7 +813,7 @@ class Cea608Channel {
   constructor(
     channelNumber: number,
     outputFilter: OutputFilter,
-    logger: CaptionsLogger
+    logger: CaptionsLogger,
   ) {
     this.chNr = channelNumber;
     this.outputFilter = outputFilter;
@@ -832,7 +863,7 @@ class Cea608Channel {
     }
 
     this.mode = newMode;
-    this.logger.log(VerboseLevel.INFO, 'MODE=' + newMode);
+    this.logger.log(VerboseLevel.INFO, () => 'MODE=' + newMode);
     if (this.mode === 'MODE_POP-ON') {
       this.writeScreen = this.nonDisplayedMemory;
     } else {
@@ -855,12 +886,12 @@ class Cea608Channel {
       this.writeScreen === this.displayedMemory ? 'DISP' : 'NON_DISP';
     this.logger.log(
       VerboseLevel.INFO,
-      screen + ': ' + this.writeScreen.getDisplayText(true)
+      () => screen + ': ' + this.writeScreen.getDisplayText(true),
     );
     if (this.mode === 'MODE_PAINT-ON' || this.mode === 'MODE_ROLL-UP') {
       this.logger.log(
         VerboseLevel.TEXT,
-        'DISPLAYED: ' + this.displayedMemory.getDisplayText(true)
+        () => 'DISPLAYED: ' + this.displayedMemory.getDisplayText(true),
       );
       this.outputDataUpdate();
     }
@@ -962,7 +993,7 @@ class Cea608Channel {
       this.writeScreen = this.nonDisplayedMemory;
       this.logger.log(
         VerboseLevel.TEXT,
-        'DISP: ' + this.displayedMemory.getDisplayText()
+        () => 'DISP: ' + this.displayedMemory.getDisplayText(),
       );
     }
     this.outputDataUpdate(true);
@@ -994,7 +1025,7 @@ class Cea608Channel {
     } else {
       styles.foreground = 'white';
     }
-    this.logger.log(VerboseLevel.INFO, 'MIDROW: ' + JSON.stringify(styles));
+    this.logger.log(VerboseLevel.INFO, 'MIDROW: ' + stringify(styles));
     this.writeScreen.setPen(styles);
   }
 
@@ -1013,7 +1044,7 @@ class Cea608Channel {
           this.outputFilter.newCue(
             this.cueStartTime!,
             time,
-            this.lastOutputScreen
+            this.lastOutputScreen,
           );
           if (dispatch && this.outputFilter.dispatchCue) {
             this.outputFilter.dispatchCue();
@@ -1049,7 +1080,8 @@ interface PACData {
 
 type SupportedField = 1 | 3;
 
-type Channels = 0 | 1 | 2; // Will be 1 or 2 when parsing captions
+type Channel = 1 | 2;
+type Channels = 0 | Channel; // Will be 1 or 2 when parsing captions
 
 type CmdHistory = {
   a: number | null;
@@ -1057,82 +1089,109 @@ type CmdHistory = {
 };
 
 class Cea608Parser {
-  channels: Array<Cea608Channel | null>;
+  channels: Array<Cea608Channel | null> = [null, null, null];
   currentChannel: Channels = 0;
-  cmdHistory: CmdHistory;
+  cmdHistory: CmdHistory = createCmdHistory();
   logger: CaptionsLogger;
+  private field: SupportedField;
+  private outputFilters: [null, OutputFilter, OutputFilter];
 
   constructor(field: SupportedField, out1: OutputFilter, out2: OutputFilter) {
-    const logger = new CaptionsLogger();
-    this.channels = [
-      null,
-      new Cea608Channel(field, out1, logger),
-      new Cea608Channel(field + 1, out2, logger),
-    ];
-    this.cmdHistory = createCmdHistory();
-    this.logger = logger;
+    this.logger = new CaptionsLogger();
+    this.field = field;
+    this.outputFilters = [null, out1, out2];
   }
 
   getHandler(channel: number) {
-    return (this.channels[channel] as Cea608Channel).getHandler();
+    return this.outputFilters[channel];
   }
 
   setHandler(channel: number, newHandler: OutputFilter) {
-    (this.channels[channel] as Cea608Channel).setHandler(newHandler);
+    this.outputFilters[channel] = newHandler;
+    this.channels[channel]?.setHandler(newHandler);
+  }
+
+  private getChannel(channelNumber: Channel): Cea608Channel {
+    let channel = this.channels[channelNumber];
+    if (!channel) {
+      channel = this.channels[channelNumber] = new Cea608Channel(
+        this.field + channelNumber - 1,
+        this.outputFilters[channelNumber],
+        this.logger,
+      );
+    }
+    return channel;
   }
 
   /**
    * Add data for time t in forms of list of bytes (unsigned ints). The bytes are treated as pairs.
    */
   addData(time: number | null, byteList: number[]) {
-    let cmdFound: boolean;
-    let a: number;
-    let b: number;
-    let charsFound: number[] | boolean | null = false;
-
     this.logger.time = time;
-
     for (let i = 0; i < byteList.length; i += 2) {
-      a = byteList[i] & 0x7f;
-      b = byteList[i + 1] & 0x7f;
+      const a = byteList[i] & 0x7f;
+      const b = byteList[i + 1] & 0x7f;
+      let cmdFound: boolean = false;
+      let charsFound: number[] | null = null;
+
       if (a === 0 && b === 0) {
         continue;
       } else {
         this.logger.log(
           VerboseLevel.DATA,
-          '[' +
+          () =>
+            '[' +
             numArrayToHexArray([byteList[i], byteList[i + 1]]) +
             '] -> (' +
             numArrayToHexArray([a, b]) +
-            ')'
+            ')',
         );
       }
 
-      cmdFound = this.parseCmd(a, b);
+      const cmdHistory = this.cmdHistory;
+      const isControlCode = a >= 0x10 && a <= 0x1f;
+      if (isControlCode) {
+        // Skip redundant control codes
+        if (hasCmdRepeated(a, b, cmdHistory)) {
+          setLastCmd(null, null, cmdHistory);
+          this.logger.log(
+            VerboseLevel.DEBUG,
+            () =>
+              'Repeated command (' +
+              numArrayToHexArray([a, b]) +
+              ') is dropped',
+          );
+          continue;
+        }
+        setLastCmd(a, b, this.cmdHistory);
 
-      if (!cmdFound) {
-        cmdFound = this.parseMidrow(a, b);
+        cmdFound = this.parseCmd(a, b);
+
+        if (!cmdFound) {
+          cmdFound = this.parseMidrow(a, b);
+        }
+
+        if (!cmdFound) {
+          cmdFound = this.parsePAC(a, b);
+        }
+
+        if (!cmdFound) {
+          cmdFound = this.parseBackgroundAttributes(a, b);
+        }
+      } else {
+        setLastCmd(null, null, cmdHistory);
       }
-
-      if (!cmdFound) {
-        cmdFound = this.parsePAC(a, b);
-      }
-
-      if (!cmdFound) {
-        cmdFound = this.parseBackgroundAttributes(a, b);
-      }
-
       if (!cmdFound) {
         charsFound = this.parseChars(a, b);
         if (charsFound) {
           const currChNr = this.currentChannel;
           if (currChNr && currChNr > 0) {
-            const channel = this.channels[currChNr] as Cea608Channel;
+            const channel = this.getChannel(currChNr);
             channel.insertChars(charsFound);
           } else {
             this.logger.log(
               VerboseLevel.WARNING,
-              'No channel found yet. TEXT-MODE?'
+              'No channel found yet. TEXT-MODE?',
             );
           }
         }
@@ -1140,10 +1199,11 @@ class Cea608Parser {
       if (!cmdFound && !charsFound) {
         this.logger.log(
           VerboseLevel.WARNING,
-          "Couldn't parse cleaned data " +
+          () =>
+            "Couldn't parse cleaned data " +
             numArrayToHexArray([a, b]) +
             ' orig: ' +
-            numArrayToHexArray([byteList[i], byteList[i + 1]])
+            numArrayToHexArray([byteList[i], byteList[i + 1]]),
         );
       }
     }
@@ -1151,10 +1211,9 @@ class Cea608Parser {
 
   /**
    * Parse Command.
-   * @returns {Boolean} Tells if a command was found
+   * @returns True if a command was found
    */
-  parseCmd(a: number, b: number) {
-    const { cmdHistory } = this;
+  parseCmd(a: number, b: number): boolean {
     const cond1 =
       (a === 0x14 || a === 0x1c || a === 0x15 || a === 0x1d) &&
       b >= 0x20 &&
@@ -1164,17 +1223,8 @@ class Cea608Parser {
       return false;
     }
 
-    if (hasCmdRepeated(a, b, cmdHistory)) {
-      setLastCmd(null, null, cmdHistory);
-      this.logger.log(
-        VerboseLevel.DEBUG,
-        'Repeated command (' + numArrayToHexArray([a, b]) + ') is dropped'
-      );
-      return true;
-    }
-
-    const chNr = a === 0x14 || a === 0x15 || a === 0x17 ? 1 : 2;
-    const channel = this.channels[chNr] as Cea608Channel;
+    const chNr: Channel = a === 0x14 || a === 0x15 || a === 0x17 ? 1 : 2;
+    const channel = this.getChannel(chNr);
 
     if (a === 0x14 || a === 0x15 || a === 0x1c || a === 0x1d) {
       if (b === 0x20) {
@@ -1214,16 +1264,14 @@ class Cea608Parser {
       // a == 0x17 || a == 0x1F
       channel.ccTO(b - 0x20);
     }
-    setLastCmd(a, b, cmdHistory);
     this.currentChannel = chNr;
     return true;
   }
 
   /**
    * Parse midrow styling command
-   * @returns {Boolean}
    */
-  parseMidrow(a: number, b: number) {
+  parseMidrow(a: number, b: number): boolean {
     let chNr: number = 0;
 
     if ((a === 0x11 || a === 0x19) && b >= 0x20 && b <= 0x2f) {
@@ -1236,7 +1284,7 @@ class Cea608Parser {
       if (chNr !== this.currentChannel) {
         this.logger.log(
           VerboseLevel.ERROR,
-          'Mismatch channel in midrow parsing'
+          'Mismatch channel in midrow parsing',
         );
         return false;
       }
@@ -1247,7 +1295,7 @@ class Cea608Parser {
       channel.ccMIDROW(b);
       this.logger.log(
         VerboseLevel.DEBUG,
-        'MIDROW (' + numArrayToHexArray([a, b]) + ')'
+        () => 'MIDROW (' + numArrayToHexArray([a, b]) + ')',
       );
       return true;
     }
@@ -1260,7 +1308,6 @@ class Cea608Parser {
    */
   parsePAC(a: number, b: number): boolean {
     let row: number;
-    const cmdHistory = this.cmdHistory;
 
     const case1 =
       ((a >= 0x11 && a <= 0x17) || (a >= 0x19 && a <= 0x1f)) &&
@@ -1271,12 +1318,7 @@ class Cea608Parser {
       return false;
     }
 
-    if (hasCmdRepeated(a, b, cmdHistory)) {
-      setLastCmd(null, null, cmdHistory);
-      return true; // Repeated commands are dropped (once)
-    }
-
-    const chNr: Channels = a <= 0x17 ? 1 : 2;
+    const chNr: Channel = a <= 0x17 ? 1 : 2;
 
     if (b >= 0x40 && b <= 0x5f) {
       row = chNr === 1 ? rowsLowCh1[a] : rowsLowCh2[a];
@@ -1284,19 +1326,15 @@ class Cea608Parser {
       // 0x60 <= b <= 0x7F
       row = chNr === 1 ? rowsHighCh1[a] : rowsHighCh2[a];
     }
-    const channel = this.channels[chNr];
-    if (!channel) {
-      return false;
-    }
+    const channel = this.getChannel(chNr);
     channel.setPAC(this.interpretPAC(row, b));
-    setLastCmd(a, b, cmdHistory);
     this.currentChannel = chNr;
     return true;
   }
 
   /**
    * Interpret the second byte of the pac, and return the information.
-   * @returns {Object} pacData with style parameters.
+   * @returns pacData with style parameters
    */
   interpretPAC(row: number, byte: number): PACData {
     let pacIndex;
@@ -1364,26 +1402,28 @@ class Cea608Parser {
 
       this.logger.log(
         VerboseLevel.INFO,
-        "Special char '" + getCharForByte(oneCode) + "' in channel " + channelNr
+        () =>
+          "Special char '" +
+          getCharForByte(oneCode) +
+          "' in channel " +
+          channelNr,
       );
       charCodes = [oneCode];
     } else if (a >= 0x20 && a <= 0x7f) {
       charCodes = b === 0 ? [a] : [a, b];
     }
     if (charCodes) {
-      const hexCodes = numArrayToHexArray(charCodes);
       this.logger.log(
         VerboseLevel.DEBUG,
-        'Char codes =  ' + hexCodes.join(',')
+        () => 'Char codes =  ' + numArrayToHexArray(charCodes).join(','),
       );
-      setLastCmd(a, b, this.cmdHistory);
     }
     return charCodes;
   }
 
   /**
    * Parse extended background attributes as well as new foreground color black.
-   * @returns {Boolean} Tells if background attributes are found
+   * @returns True if background attributes are found
    */
   parseBackgroundAttributes(a: number, b: number): boolean {
     const case1 = (a === 0x10 || a === 0x18) && b >= 0x20 && b <= 0x2f;
@@ -1407,10 +1447,9 @@ class Cea608Parser {
         bkgData.underline = true;
       }
     }
-    const chNr: Channels = a <= 0x17 ? 1 : 2;
-    const channel: Cea608Channel = this.channels[chNr] as Cea608Channel;
+    const chNr: Channel = a <= 0x17 ? 1 : 2;
+    const channel = this.getChannel(chNr);
     channel.setBkgData(bkgData);
-    setLastCmd(a, b, this.cmdHistory);
     return true;
   }
 
@@ -1424,7 +1463,7 @@ class Cea608Parser {
         channel.reset();
       }
     }
-    this.cmdHistory = createCmdHistory();
+    setLastCmd(null, null, this.cmdHistory);
   }
 
   /**
@@ -1443,7 +1482,7 @@ class Cea608Parser {
 function setLastCmd(
   a: number | null,
   b: number | null,
-  cmdHistory: CmdHistory
+  cmdHistory: CmdHistory,
 ) {
   cmdHistory.a = a;
   cmdHistory.b = b;
